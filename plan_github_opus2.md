@@ -3,7 +3,7 @@
 > ต่อจาก `plan_github_opus.md` (ฟีเจอร์ #1–#10)  
 > สร้างจากการวิเคราะห์โค้ดทั้งโปรเจกต์ เมื่อ 2026-02-09  
 > โปรเจกต์: **MiniCut (Flet)** — MVP ตัดต่อวิดีโอแบบเบาๆ คล้าย CapCut  
-> Stack: Python + Flet 0.28 + FFmpeg (subprocess)
+> Stack: Python + Flet 0.80.5 + flet-video/flet-audio + FFmpeg (subprocess)
 
 ---
 
@@ -559,7 +559,7 @@ for s in streams:
 
 ### แนวทาง
 - ใช้ `page.on_drop` หรือ DragTarget ที่ครอบ Media Bin ทั้งอัน
-- Flet 0.28 รองรับ `page.on_drop` สำหรับ file drop จาก OS
+- Flet 0.80.5 รองรับ `page.on_drop` สำหรับ file drop จาก OS
 - เมื่อรับไฟล์ → probe แล้วเพิ่มเข้า Media Bin เหมือน import ปกติ
 
 ### โค้ดตัวอย่าง

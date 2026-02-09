@@ -2,7 +2,7 @@
 
 > สร้างจากการวิเคราะห์โค้ดทั้งโปรเจกต์ เมื่อ 2026-02-09  
 > โปรเจกต์: **MiniCut (Flet)** — MVP ตัดต่อวิดีโอแบบเบาๆ คล้าย CapCut  
-> Stack: Python + Flet 0.28 + FFmpeg (subprocess)
+> Stack: Python + Flet 0.80.5 + flet-video/flet-audio + FFmpeg (subprocess)
 
 ---
 

@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import List, Optional
 
 import flet as ft
+import flet_audio as fta
+import flet_video as ftv
 
 from core.ffmpeg import FFmpegNotFound, export_project, probe_media, resolve_ffmpeg_bins
 from core.model import Project
@@ -49,8 +51,8 @@ class AppState:
 
 def main(page: ft.Page) -> None:
     page.title = "MiniCut (MVP)"
-    page.window_width = 1100
-    page.window_height = 720
+    page.window.width = 1100
+    page.window.height = 720
     page.theme_mode = ft.ThemeMode.DARK
     page.padding = 10
 
@@ -59,9 +61,8 @@ def main(page: ft.Page) -> None:
 
     # ---------- helpers ----------
     def snack(msg: str) -> None:
-        page.snack_bar = ft.SnackBar(ft.Text(msg))
-        page.snack_bar.open = True
-        page.update()
+        # SnackBar is a DialogControl in newer Flet versions.
+        page.show_dialog(ft.SnackBar(ft.Text(msg)))
 
     def get_bins() -> Optional[tuple[str, str]]:
         try:
@@ -116,36 +117,10 @@ def main(page: ft.Page) -> None:
             )
         page.update()
 
-    def on_pick_files(e: ft.FilePickerResultEvent) -> None:
-        if not e.files:
-            return
-        bins = get_bins()
-        if not bins:
-            return
-        _, ffprobe = bins
+    file_picker = ft.FilePicker()
 
-        for f in e.files:
-            try:
-                info = probe_media(ffprobe, f.path)
-                if info.duration <= 0.01:
-                    continue
-                state.media.append(
-                    MediaItem(
-                        path=f.path,
-                        duration=info.duration,
-                        has_video=info.has_video,
-                        has_audio=info.has_audio,
-                    )
-                )
-            except Exception as ex:
-                log.exception("probe failed: %s", ex)
-                snack(f"อ่านไฟล์ไม่สำเร็จ: {Path(f.path).name}")
-
-        refresh_media()
-
-    picker = ft.FilePicker(on_result=on_pick_files)
-    page.overlay.append(picker)
-    audio = ft.Audio(volume=1.0)
+    # Non-visual audio player for A1 preview.
+    audio = fta.Audio(volume=1.0)
     page.overlay.append(audio)
 
     # ---------- Preview / Inspector ----------
@@ -216,7 +191,7 @@ def main(page: ft.Page) -> None:
         spacing=4,
     )
 
-    def on_audio_position(e: ft.AudioPositionChangeEvent) -> None:
+    def on_audio_position(e: fta.AudioPositionChangeEvent) -> None:
         if state.selected_track != "a":
             return
         clip = _selected_clip()
@@ -231,7 +206,7 @@ def main(page: ft.Page) -> None:
         if e.position >= int(clip.out_sec * 1000) - 30:
             _stop_audio_to_clip_start()
 
-    audio.on_position_changed = on_audio_position
+    audio.on_position_change = on_audio_position
 
     def update_inspector() -> None:
         clip = _selected_clip()
@@ -265,9 +240,9 @@ def main(page: ft.Page) -> None:
             audio_controls.visible = False
             audio_pos.visible = False
             _stop_audio_to_clip_start()
-            preview_host.content = ft.Video(
+            preview_host.content = ftv.Video(
                 expand=True,
-                playlist=[ft.VideoMedia(clip.src)],
+                playlist=[ftv.VideoMedia(clip.src)],
                 autoplay=False,
                 muted=True,
                 show_controls=True,
@@ -489,10 +464,42 @@ def main(page: ft.Page) -> None:
 
     # ---------- Actions ----------
     def import_click(_e):
-        picker.pick_files(
-            allow_multiple=True,
-            allowed_extensions=["mp4", "mov", "mkv", "mp3", "wav", "m4a", "aac", "flac", "ogg"],
-        )
+        async def _pick() -> None:
+            picked = await file_picker.pick_files(
+                allow_multiple=True,
+                file_type=ft.FilePickerFileType.CUSTOM,
+                allowed_extensions=["mp4", "mov", "mkv", "mp3", "wav", "m4a", "aac", "flac", "ogg"],
+            )
+            if not picked:
+                return
+
+            bins = get_bins()
+            if not bins:
+                return
+            _, ffprobe = bins
+
+            for f in picked:
+                if not f.path:
+                    continue
+                try:
+                    info = probe_media(ffprobe, f.path)
+                    if info.duration <= 0.01:
+                        continue
+                    state.media.append(
+                        MediaItem(
+                            path=f.path,
+                            duration=info.duration,
+                            has_video=info.has_video,
+                            has_audio=info.has_audio,
+                        )
+                    )
+                except Exception as ex:
+                    log.exception("probe failed: %s", ex)
+                    snack(f"อ่านไฟล์ไม่สำเร็จ: {Path(f.path).name}")
+
+            refresh_media()
+
+        page.run_task(_pick)
 
     def split_click(_e):
         if not state.selected_track or not state.selected_clip_id:
@@ -538,35 +545,53 @@ def main(page: ft.Page) -> None:
         except Exception as ex:
             snack(f"โหลดล้มเหลว: {ex}")
 
-    def on_save_result(e: ft.FilePickerResultEvent) -> None:
-        if not e.path:
-            return
-        bins = get_bins()
-        if not bins:
-            return
-        ffmpeg, ffprobe = bins
-        try:
-            export_project(
-                ffmpeg,
-                ffprobe,
-                state.project.v_clips,
-                state.project.a_clips,
-                e.path,
-                audio_mode=state.export_audio_mode,
-            )
-            snack("Export เสร็จ")
-        except Exception as ex:
-            log.exception("export failed: %s", ex)
-            snack(f"Export ล้มเหลว: {ex}")
-
-    save_picker = ft.FilePicker(on_result=on_save_result)
-    page.overlay.append(save_picker)
-
     def export_click(_e):
         if not state.project.v_clips:
             snack("Timeline ว่าง")
             return
-        save_picker.save_file(file_name="output.mp4", allowed_extensions=["mp4"])
+
+        async def _save_and_export() -> None:
+            out_path = await file_picker.save_file(
+                file_name="output.mp4",
+                file_type=ft.FilePickerFileType.CUSTOM,
+                allowed_extensions=["mp4"],
+            )
+            if not out_path:
+                return
+
+            bins = get_bins()
+            if not bins:
+                return
+            ffmpeg, ffprobe = bins
+
+            # Snapshot to keep export deterministic if the user keeps editing.
+            v_clips = list(state.project.v_clips)
+            a_clips = list(state.project.a_clips)
+            audio_mode = state.export_audio_mode
+
+            def _do_export() -> None:
+                try:
+                    export_project(
+                        ffmpeg,
+                        ffprobe,
+                        v_clips,
+                        a_clips,
+                        out_path,
+                        audio_mode=audio_mode,
+                    )
+                    msg = "Export เสร็จ"
+                except Exception as ex:
+                    log.exception("export failed: %s", ex)
+                    msg = f"Export ล้มเหลว: {ex}"
+
+                async def _notify() -> None:
+                    snack(msg)
+
+                page.run_task(_notify)
+
+            page.run_thread(_do_export)
+
+        page.run_task(_save_and_export)
 
     def on_audio_mode_change(e: ft.ControlEvent) -> None:
         state.export_audio_mode = str(e.control.value)
@@ -581,7 +606,7 @@ def main(page: ft.Page) -> None:
             ft.dropdown.Option(key="a1_only", text="A1 only (mute V1)"),
             ft.dropdown.Option(key="v1_only", text="V1 only (ignore A1)"),
         ],
-        on_change=on_audio_mode_change,
+        on_select=on_audio_mode_change,
     )
 
     # ---------- Layout ----------
@@ -651,7 +676,7 @@ def main(page: ft.Page) -> None:
     timeline = ft.Container(
         padding=10,
         border_radius=12,
-        bgcolor=ft.Colors.BLUE_GREY_950,
+        bgcolor=ft.Colors.BLUE_GREY_900,
         content=ft.Column(
             [
                 ft.Row([timeline_info, ft.Container(expand=True), ft.Text("Zoom"), timeline_zoom]),

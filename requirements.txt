@@ -1,2 +1,5 @@
-flet==0.28.1
-# flet-video removed as it incompatible with flet 0.28
+flet==0.80.5
+flet-cli==0.80.5
+flet-desktop==0.80.5
+flet-video==0.80.5
+flet-audio==0.80.5

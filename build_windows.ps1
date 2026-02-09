@@ -4,11 +4,15 @@
 
 $ErrorActionPreference = "Stop"
 
-if (!(Test-Path ".venv")) { python -m venv .venv }
-. .\.venv\Scripts\Activate.ps1
+$root = Split-Path -Parent $MyInvocation.MyCommand.Path
+Set-Location $root
 
-python -m pip install --upgrade pip
-pip install -r requirements.txt
+if (!(Test-Path ".venv")) { python -m venv .venv }
+$py = Join-Path $root ".venv\\Scripts\\python.exe"
+if (!(Test-Path $py)) { throw "Python venv not found: $py" }
+
+& $py -m pip install --upgrade pip
+& $py -m pip install -r requirements.txt
 
 if (!(Test-Path "bin\ffmpeg.exe") -or !(Test-Path "bin\ffprobe.exe")) {
   Write-Host "WARN: ไม่พบ bin\ffmpeg.exe หรือ bin\ffprobe.exe"
@@ -16,7 +20,10 @@ if (!(Test-Path "bin\ffmpeg.exe") -or !(Test-Path "bin\ffprobe.exe")) {
 }
 
 # -D = one-folder bundle (ลดปัญหา antivirus/onefile)
-flet pack app.py -n MiniCut -D `
+$flet = Join-Path $root ".venv\\Scripts\\flet.exe"
+if (!(Test-Path $flet)) { $flet = "flet" }
+
+& $flet pack app.py -n MiniCut -D `
   --add-binary "bin\ffmpeg.exe:bin\ffmpeg.exe:win32" `
   --add-binary "bin\ffprobe.exe:bin\ffprobe.exe:win32"
 
