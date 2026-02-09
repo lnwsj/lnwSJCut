@@ -1,0 +1,2 @@
+flet==0.28.1
+# flet-video removed as it incompatible with flet 0.28
