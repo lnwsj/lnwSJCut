@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
@@ -10,6 +11,7 @@ import flet_audio as fta
 import flet_video as ftv
 
 from core.ffmpeg import FFmpegNotFound, export_project, probe_media, resolve_ffmpeg_bins
+from core.history import HistoryEntry, HistoryManager
 from core.model import Project
 from core.project_io import load_project, save_project
 from core.timeline import (
@@ -58,6 +60,7 @@ def main(page: ft.Page) -> None:
 
     root = Path(__file__).resolve().parent
     state = AppState()
+    history = HistoryManager(limit=50)
 
     # ---------- helpers ----------
     def snack(msg: str) -> None:
@@ -87,6 +90,75 @@ def main(page: ft.Page) -> None:
         if not state.selected_track or not state.selected_clip_id:
             return None
         return _find_clip(state.selected_track, state.selected_clip_id)
+
+    # ---------- Undo / Redo ----------
+    def _history_current(label: str = "(current)") -> HistoryEntry:
+        return HistoryEntry(
+            label=label,
+            project=state.project.to_dict(),
+            selected_track=state.selected_track,
+            selected_clip_id=state.selected_clip_id,
+        )
+
+    def _history_record(label: str) -> None:
+        history.record(
+            HistoryEntry(
+                label=label,
+                project=state.project.to_dict(),
+                selected_track=state.selected_track,
+                selected_clip_id=state.selected_clip_id,
+            )
+        )
+        _refresh_history_controls()
+
+    def _history_apply(entry: HistoryEntry) -> None:
+        state.project = Project.from_dict(entry.project)
+        state.selected_track = entry.selected_track
+        state.selected_clip_id = entry.selected_clip_id
+        _refresh_history_controls()
+        update_inspector()
+        refresh_timeline()
+
+    def undo_click(_e=None) -> None:
+        entry = history.undo(_history_current())
+        if not entry:
+            return
+        _history_apply(entry)
+        snack(f"Undo: {entry.label}")
+
+    def redo_click(_e=None) -> None:
+        entry = history.redo(_history_current())
+        if not entry:
+            return
+        _history_apply(entry)
+        snack(f"Redo: {entry.label}")
+
+    undo_btn = ft.IconButton(ft.Icons.UNDO, tooltip="Undo (Ctrl+Z)", on_click=undo_click, disabled=True)
+    redo_btn = ft.IconButton(ft.Icons.REDO, tooltip="Redo (Ctrl+Y)", on_click=redo_click, disabled=True)
+
+    def _refresh_history_controls() -> None:
+        undo_btn.disabled = not history.can_undo()
+        redo_btn.disabled = not history.can_redo()
+
+        if history.can_undo():
+            undo_btn.tooltip = f"Undo: {history.peek_undo_label()} (Ctrl+Z)"
+        else:
+            undo_btn.tooltip = "Undo (Ctrl+Z)"
+
+        if history.can_redo():
+            redo_btn.tooltip = f"Redo: {history.peek_redo_label()} (Ctrl+Y)"
+        else:
+            redo_btn.tooltip = "Redo (Ctrl+Y)"
+
+    def on_keyboard(e: ft.KeyboardEvent) -> None:
+        key = (e.key or "").lower()
+        if e.ctrl and not e.shift and key == "z":
+            undo_click()
+        elif e.ctrl and (key == "y" or (e.shift and key == "z")):
+            redo_click()
+
+    page.on_keyboard_event = on_keyboard
+    _refresh_history_controls()
 
     # ---------- Media Bin ----------
     media_list = ft.ListView(expand=True, spacing=4, auto_scroll=False)
@@ -119,9 +191,16 @@ def main(page: ft.Page) -> None:
 
     file_picker = ft.FilePicker()
 
-    # Non-visual audio player for A1 preview.
-    audio = fta.Audio(volume=1.0)
-    page.overlay.append(audio)
+    # NOTE: Some desktop builds show a confusing "Unknown control: Audio" error
+    # if the client doesn't have flet-audio enabled. Keep preview disabled by
+    # default and allow opt-in via env var.
+    audio_preview_enabled = os.environ.get("MINICUT_AUDIO_PREVIEW", "0") == "1"
+
+    audio = None
+    if audio_preview_enabled:
+        # Non-visual audio player for A1 preview.
+        audio = fta.Audio(volume=1.0)
+        page.overlay.append(audio)
 
     # ---------- Preview / Inspector ----------
     selected_title = ft.Text("No clip selected", weight=ft.FontWeight.BOLD)
@@ -141,18 +220,48 @@ def main(page: ft.Page) -> None:
     audio_pos = ft.Text("", size=12, color=ft.Colors.WHITE70, visible=False)
 
     def _stop_audio_to_clip_start(_e=None) -> None:
-        clip = _selected_clip()
-        try:
-            audio.pause()
-        except Exception:
+        if not audio_preview_enabled or audio is None:
             return
+        clip = _selected_clip()
+
+        # flet_audio Audio methods are async; schedule them on the page task loop.
+        target_ms = None
         if clip and state.selected_track == "a":
+            if audio.src != clip.src:
+                audio.src = clip.src
+                audio.update()
+            target_ms = int(clip.in_sec * 1000)
+
+        async def _do() -> None:
             try:
-                audio.seek(int(clip.in_sec * 1000))
+                await audio.pause()
+            except Exception:
+                return
+            if target_ms is not None:
+                try:
+                    await audio.seek(target_ms)
+                except Exception:
+                    pass
+
+        page.run_task(_do)
+
+    def _pause_audio(_e=None) -> None:
+        if not audio_preview_enabled or audio is None:
+            snack("ปิดพรีวิวเสียงอยู่ (ตั้งค่า MINICUT_AUDIO_PREVIEW=1 เพื่อเปิดใช้งาน)")
+            return
+
+        async def _do() -> None:
+            try:
+                await audio.pause()
             except Exception:
                 pass
 
+        page.run_task(_do)
+
     def _play_audio(from_split: bool) -> None:
+        if not audio_preview_enabled or audio is None:
+            snack("ปิดพรีวิวเสียงอยู่ (ตั้งค่า MINICUT_AUDIO_PREVIEW=1 เพื่อเปิดใช้งาน)")
+            return
         if state.selected_track != "a":
             snack("เลือกคลิปเสียง (A1) ก่อน")
             return
@@ -169,8 +278,19 @@ def main(page: ft.Page) -> None:
         offset = float(split_slider.value) if from_split else 0.0
         start = clip.in_sec + offset
         start = min(max(clip.in_sec, start), max(clip.in_sec, clip.out_sec - 0.01))
-        audio.seek(int(start * 1000))
-        audio.play()
+        start_ms = int(start * 1000)
+
+        async def _do() -> None:
+            try:
+                await audio.seek(start_ms)
+            except Exception:
+                pass
+            try:
+                await audio.play()
+            except Exception:
+                pass
+
+        page.run_task(_do)
 
     audio_controls = ft.Row(
         [
@@ -184,7 +304,7 @@ def main(page: ft.Page) -> None:
                 tooltip="Play (from split point)",
                 on_click=lambda _e: _play_audio(from_split=True),
             ),
-            ft.IconButton(ft.Icons.PAUSE, tooltip="Pause", on_click=lambda _e: audio.pause()),
+            ft.IconButton(ft.Icons.PAUSE, tooltip="Pause", on_click=_pause_audio),
             ft.IconButton(ft.Icons.STOP, tooltip="Stop", on_click=_stop_audio_to_clip_start),
         ],
         visible=False,
@@ -192,6 +312,8 @@ def main(page: ft.Page) -> None:
     )
 
     def on_audio_position(e: fta.AudioPositionChangeEvent) -> None:
+        if not audio_preview_enabled:
+            return
         if state.selected_track != "a":
             return
         clip = _selected_clip()
@@ -206,7 +328,8 @@ def main(page: ft.Page) -> None:
         if e.position >= int(clip.out_sec * 1000) - 30:
             _stop_audio_to_clip_start()
 
-    audio.on_position_change = on_audio_position
+    if audio_preview_enabled and audio is not None:
+        audio.on_position_change = on_audio_position
 
     def update_inspector() -> None:
         clip = _selected_clip()
@@ -248,21 +371,20 @@ def main(page: ft.Page) -> None:
                 show_controls=True,
             )
         else:
-            audio_controls.visible = True
-            audio_pos.visible = True
-            try:
-                audio.pause()
-            except Exception:
-                pass
-            if audio.src != clip.src:
-                audio.src = clip.src
-                audio.update()
-            try:
-                audio.seek(int(clip.in_sec * 1000))
-            except Exception:
-                pass
+            audio_controls.visible = audio_preview_enabled
+            audio_pos.visible = audio_preview_enabled
+            _stop_audio_to_clip_start()
             audio_pos.value = f"{_fmt_time(0.0)} / {_fmt_time(clip.dur)}"
-            preview_host.content = ft.Text("Audio selected: use controls below to listen", color=ft.Colors.WHITE70)
+            if audio_preview_enabled:
+                preview_host.content = ft.Text(
+                    "Audio selected: use controls below to listen",
+                    color=ft.Colors.WHITE70,
+                )
+            else:
+                preview_host.content = ft.Text(
+                    "ปิดพรีวิวเสียงอยู่ (ตั้งค่า MINICUT_AUDIO_PREVIEW=1 เพื่อเปิดใช้งาน)",
+                    color=ft.Colors.WHITE70,
+                )
         page.update()
 
     def on_split_slider(e: ft.ControlEvent) -> None:
@@ -338,12 +460,16 @@ def main(page: ft.Page) -> None:
                     snack("No audio stream")
                     return
 
-                clips = _track_clips(track)
+                before = _track_clips(track)
                 if target_clip_id:
-                    clips = insert_clip_before(clips, target_clip_id, path, mi.duration)
+                    clips = insert_clip_before(before, target_clip_id, path, mi.duration)
                 else:
-                    clips = add_clip_end(clips, path, mi.duration)
-                _set_track_clips(track, clips)
+                    clips = add_clip_end(before, path, mi.duration)
+
+                if clips != before:
+                    tr = "V1" if track == "v" else "A1"
+                    _history_record(f"Add {Path(path).name} to {tr}")
+                    _set_track_clips(track, clips)
             elif kind == "clip":
                 moving_id = payload.get("id")
                 moving_track = payload.get("track")
@@ -352,13 +478,13 @@ def main(page: ft.Page) -> None:
                 if moving_track != track:
                     return
 
-                clips = _track_clips(track)
+                before = _track_clips(track)
                 if target_clip_id:
-                    clips = move_clip_before(clips, moving_id, target_clip_id)
+                    clips = move_clip_before(before, moving_id, target_clip_id)
                 else:
                     moving = None
                     rest = []
-                    for c in clips:
+                    for c in before:
                         if c.id == moving_id:
                             moving = c
                         else:
@@ -366,7 +492,12 @@ def main(page: ft.Page) -> None:
                     if moving is None:
                         return
                     clips = [*rest, moving]
-                _set_track_clips(track, clips)
+
+                if clips != before:
+                    m = _find_clip(track, moving_id)
+                    name = m.name if m else moving_id
+                    _history_record(f"Move {name}")
+                    _set_track_clips(track, clips)
             refresh_timeline()
 
         def _payload(e: ft.DragTargetEvent):
@@ -505,12 +636,16 @@ def main(page: ft.Page) -> None:
         if not state.selected_track or not state.selected_clip_id:
             snack("เลือกคลิปก่อน")
             return
-        clips = _track_clips(state.selected_track)
-        clips, state.selected_clip_id, msg = split_clip(
-            clips,
+        before = _track_clips(state.selected_track)
+        selected = _find_clip(state.selected_track, state.selected_clip_id)
+        clips, new_selected, msg = split_clip(
+            before,
             state.selected_clip_id,
             float(split_slider.value),
         )
+        if clips != before:
+            _history_record(f"Split {selected.name if selected else 'clip'}")
+        state.selected_clip_id = new_selected
         _set_track_clips(state.selected_track, clips)
         snack(msg)
         update_inspector()
@@ -520,7 +655,11 @@ def main(page: ft.Page) -> None:
         if not state.selected_track or not state.selected_clip_id:
             snack("เลือกคลิปก่อน")
             return
-        clips = [c for c in _track_clips(state.selected_track) if c.id != state.selected_clip_id]
+        before = _track_clips(state.selected_track)
+        selected = _find_clip(state.selected_track, state.selected_clip_id)
+        clips = [c for c in before if c.id != state.selected_clip_id]
+        if clips != before:
+            _history_record(f"Delete {selected.name if selected else 'clip'}")
         _set_track_clips(state.selected_track, clips)
         state.selected_clip_id = None
         state.selected_track = None
@@ -536,7 +675,9 @@ def main(page: ft.Page) -> None:
 
     def load_click(_e):
         try:
-            state.project = load_project(str(root / "project.json"))
+            new_project = load_project(str(root / "project.json"))
+            _history_record("Load project.json")
+            state.project = new_project
             state.selected_clip_id = None
             state.selected_track = None
             snack("โหลด project.json แล้ว")
@@ -613,6 +754,8 @@ def main(page: ft.Page) -> None:
     toolbar = ft.Row(
         [
             ft.ElevatedButton("Import", icon=ft.Icons.UPLOAD_FILE, on_click=import_click),
+            undo_btn,
+            redo_btn,
             ft.ElevatedButton("Split", icon=ft.Icons.CONTENT_CUT, on_click=split_click),
             ft.OutlinedButton("Delete", icon=ft.Icons.DELETE, on_click=delete_click),
             ft.OutlinedButton("Save", icon=ft.Icons.SAVE, on_click=save_click),
