@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from dataclasses import dataclass
@@ -10,6 +11,7 @@ import flet as ft
 import flet_audio as fta
 import flet_video as ftv
 
+from core.config import ConfigStore
 from core.ffmpeg import FFmpegNotFound, export_project, probe_media, resolve_ffmpeg_bins
 from core.history import HistoryEntry, HistoryManager
 from core.model import Project
@@ -20,6 +22,7 @@ from core.timeline import (
     move_clip_before,
     split_clip,
     total_duration,
+    trim_clip,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -45,6 +48,8 @@ class AppState:
     def __init__(self) -> None:
         self.media: List[MediaItem] = []
         self.project: Project = Project(v_clips=[], a_clips=[], fps=30)
+        self.project_path: Optional[str] = None
+        self.dirty: bool = False
         self.selected_track: Optional[str] = None  # "v" | "a"
         self.selected_clip_id: Optional[str] = None
         self.px_per_sec: float = 60.0  # timeline zoom
@@ -61,6 +66,10 @@ def main(page: ft.Page) -> None:
     root = Path(__file__).resolve().parent
     state = AppState()
     history = HistoryManager(limit=50)
+    cfg = ConfigStore.default()
+
+    # Default project path keeps existing behavior (single project.json in repo root).
+    state.project_path = str(root / "project.json")
 
     # ---------- helpers ----------
     def snack(msg: str) -> None:
@@ -73,6 +82,44 @@ def main(page: ft.Page) -> None:
         except FFmpegNotFound as e:
             snack(str(e))
             return None
+
+    def _update_title() -> None:
+        name = Path(state.project_path).name if state.project_path else "Untitled"
+        dirty = " *" if state.dirty else ""
+        page.title = f"MiniCut (MVP) - {name}{dirty}"
+
+    def _mark_dirty() -> None:
+        state.dirty = True
+        _update_title()
+
+    def _mark_saved() -> None:
+        state.dirty = False
+        _update_title()
+
+    def _parse_time_input(raw: str) -> Optional[float]:
+        """
+        Accept seconds (e.g. "3.5") or timestamps ("mm:ss", "hh:mm:ss").
+        """
+        s = str(raw or "").strip()
+        if not s:
+            return None
+
+        try:
+            if ":" not in s:
+                return float(s)
+
+            parts = s.split(":")
+            if len(parts) == 2:
+                mm, ss = parts
+                return int(mm) * 60 + float(ss)
+            if len(parts) == 3:
+                hh, mm, ss = parts
+                return int(hh) * 3600 + int(mm) * 60 + float(ss)
+        except Exception:
+            return None
+        return None
+
+    _update_title()
 
     def _track_clips(track: str):
         return state.project.v_clips if track == "v" else state.project.a_clips
@@ -124,6 +171,7 @@ def main(page: ft.Page) -> None:
         if not entry:
             return
         _history_apply(entry)
+        _mark_dirty()
         snack(f"Undo: {entry.label}")
 
     def redo_click(_e=None) -> None:
@@ -131,6 +179,7 @@ def main(page: ft.Page) -> None:
         if not entry:
             return
         _history_apply(entry)
+        _mark_dirty()
         snack(f"Redo: {entry.label}")
 
     undo_btn = ft.IconButton(ft.Icons.UNDO, tooltip="Undo (Ctrl+Z)", on_click=undo_click, disabled=True)
@@ -150,12 +199,70 @@ def main(page: ft.Page) -> None:
         else:
             redo_btn.tooltip = "Redo (Ctrl+Y)"
 
+    def _select_neighbor(delta: int) -> None:
+        track = state.selected_track
+        if track not in ("v", "a"):
+            track = "v" if state.project.v_clips else ("a" if state.project.a_clips else None)
+        if track is None:
+            return
+
+        clips = _track_clips(track)
+        if not clips:
+            return
+
+        idx = 0
+        if state.selected_track == track and state.selected_clip_id:
+            for i, c in enumerate(clips):
+                if c.id == state.selected_clip_id:
+                    idx = i
+                    break
+
+        new_idx = max(0, min(len(clips) - 1, idx + int(delta)))
+        if new_idx == idx and state.selected_clip_id == clips[idx].id:
+            return
+
+        state.selected_track = track
+        state.selected_clip_id = clips[new_idx].id
+        update_inspector()
+        refresh_timeline()
+
     def on_keyboard(e: ft.KeyboardEvent) -> None:
-        key = (e.key or "").lower()
-        if e.ctrl and not e.shift and key == "z":
+        key = (getattr(e, "key", "") or "").lower()
+        ctrl = bool(getattr(e, "ctrl", False))
+        shift = bool(getattr(e, "shift", False))
+        alt = bool(getattr(e, "alt", False))
+        meta = bool(getattr(e, "meta", False))
+
+        if ctrl and not shift and key == "z":
             undo_click()
-        elif e.ctrl and (key == "y" or (e.shift and key == "z")):
+        elif ctrl and (key == "y" or (shift and key == "z")):
             redo_click()
+        elif (key == "delete" or key == "backspace") and not (ctrl or alt or meta):
+            delete_click(None)
+        elif ctrl and key == "s":
+            save_click(None)
+        elif not ctrl and key == "s":
+            split_click(None)
+        elif ctrl and key == "e":
+            export_click(None)
+        elif ctrl and key == "i":
+            import_click(None)
+        elif key in ("+", "=", "add"):
+            try:
+                timeline_zoom.value = min(180, float(timeline_zoom.value) + 10)
+                on_zoom(None)
+            except Exception:
+                pass
+        elif key in ("-", "_", "subtract"):
+            try:
+                timeline_zoom.value = max(20, float(timeline_zoom.value) - 10)
+                on_zoom(None)
+            except Exception:
+                pass
+        elif key in ("arrow left", "left", "arrowleft"):
+            _select_neighbor(-1)
+        elif key in ("arrow right", "right", "arrowright"):
+            _select_neighbor(1)
 
     page.on_keyboard_event = on_keyboard
     _refresh_history_controls()
@@ -191,6 +298,49 @@ def main(page: ft.Page) -> None:
 
     file_picker = ft.FilePicker()
 
+    recent_menu = ft.PopupMenuButton(icon=ft.Icons.HISTORY, tooltip="Recent projects", items=[])
+
+    def _open_project(path: str) -> None:
+        try:
+            state.project = load_project(path)
+            state.project_path = path
+            state.selected_clip_id = None
+            state.selected_track = None
+
+            history.clear()
+            _refresh_history_controls()
+
+            cfg.add_recent_project(path)
+            _mark_saved()
+            _refresh_recent_menu()
+
+            snack(f"Opened: {Path(path).name}")
+            update_inspector()
+            refresh_timeline()
+        except Exception as ex:
+            snack(f"Open failed: {ex}")
+
+    def _clear_recent(_e=None) -> None:
+        cfg.clear_recent_projects()
+        _refresh_recent_menu()
+        page.update()
+
+    def _refresh_recent_menu() -> None:
+        items: List[ft.PopupMenuItem] = []
+        recents = cfg.recent_projects(limit=10)
+        if not recents:
+            items.append(ft.PopupMenuItem("No recent projects", disabled=True))
+        else:
+            for rp in recents:
+                p = rp.path
+                label = rp.name or Path(p).name
+                items.append(ft.PopupMenuItem(label, on_click=lambda _e, path=p: _open_project(path)))
+            items.append(ft.PopupMenuItem("Clear recent", on_click=_clear_recent))
+        recent_menu.items = items
+
+    recent_menu.on_open = lambda _e: _refresh_recent_menu()
+    _refresh_recent_menu()
+
     # NOTE: Some desktop builds show a confusing "Unknown control: Audio" error
     # if the client doesn't have flet-audio enabled. Keep preview disabled by
     # default and allow opt-in via env var.
@@ -207,6 +357,43 @@ def main(page: ft.Page) -> None:
     selected_range = ft.Text("")
     split_label = ft.Text("Split: -")
     split_slider = ft.Slider(min=0, max=1, value=0.5, divisions=200)
+
+    trim_in = ft.TextField(label="In", width=110, dense=True)
+    trim_out = ft.TextField(label="Out", width=110, dense=True)
+
+    def trim_click(_e=None) -> None:
+        if not state.selected_track or not state.selected_clip_id:
+            snack("เลือกคลิปก่อน")
+            return
+        clip = _selected_clip()
+        if not clip:
+            snack("ไม่พบคลิป")
+            return
+
+        new_in = _parse_time_input(trim_in.value)
+        new_out = _parse_time_input(trim_out.value)
+        if new_in is None or new_out is None:
+            snack("Trim: รูปแบบเวลาไม่ถูกต้อง (ใส่วินาทีหรือ mm:ss)")
+            return
+
+        # Best-effort duration validation if we know it (imported media).
+        mi = next((m for m in state.media if m.path == clip.src), None)
+        if mi and new_out > mi.duration + 1e-6:
+            snack(f"Trim: out เกินความยาวไฟล์ ({_fmt_time(mi.duration)})")
+            return
+
+        before = _track_clips(state.selected_track)
+        clips, msg = trim_clip(before, clip.id, new_in, new_out)
+        if clips != before:
+            _history_record(f"Trim {clip.name}")
+            _set_track_clips(state.selected_track, clips)
+            _mark_dirty()
+        snack(msg)
+        update_inspector()
+        refresh_timeline()
+
+    trim_apply = ft.FilledButton("Apply Trim", icon=ft.Icons.CUT, on_click=trim_click)
+    trim_row = ft.Row([trim_in, trim_out, trim_apply], visible=False, spacing=6)
 
     preview_host = ft.Container(
         height=260,
@@ -343,6 +530,9 @@ def main(page: ft.Page) -> None:
             split_slider.min = 0
             split_slider.max = 1
             split_slider.value = 0.5
+            trim_in.value = ""
+            trim_out.value = ""
+            trim_row.visible = False
             audio_controls.visible = False
             audio_pos.visible = False
             _stop_audio_to_clip_start()
@@ -353,6 +543,9 @@ def main(page: ft.Page) -> None:
         prefix = "[V1]" if state.selected_track == "v" else "[A1]"
         selected_title.value = f"{prefix} {clip.name}"
         selected_range.value = f"in={_fmt_time(clip.in_sec)}  out={_fmt_time(clip.out_sec)}  dur={_fmt_time(clip.dur)}"
+        trim_in.value = _fmt_time(clip.in_sec)
+        trim_out.value = _fmt_time(clip.out_sec)
+        trim_row.visible = True
 
         split_slider.min = 0
         split_slider.max = max(0.01, clip.dur)
@@ -470,6 +663,7 @@ def main(page: ft.Page) -> None:
                     tr = "V1" if track == "v" else "A1"
                     _history_record(f"Add {Path(path).name} to {tr}")
                     _set_track_clips(track, clips)
+                    _mark_dirty()
             elif kind == "clip":
                 moving_id = payload.get("id")
                 moving_track = payload.get("track")
@@ -498,6 +692,7 @@ def main(page: ft.Page) -> None:
                     name = m.name if m else moving_id
                     _history_record(f"Move {name}")
                     _set_track_clips(track, clips)
+                    _mark_dirty()
             refresh_timeline()
 
         def _payload(e: ft.DragTargetEvent):
@@ -647,6 +842,8 @@ def main(page: ft.Page) -> None:
             _history_record(f"Split {selected.name if selected else 'clip'}")
         state.selected_clip_id = new_selected
         _set_track_clips(state.selected_track, clips)
+        if clips != before:
+            _mark_dirty()
         snack(msg)
         update_inspector()
         refresh_timeline()
@@ -661,6 +858,8 @@ def main(page: ft.Page) -> None:
         if clips != before:
             _history_record(f"Delete {selected.name if selected else 'clip'}")
         _set_track_clips(state.selected_track, clips)
+        if clips != before:
+            _mark_dirty()
         state.selected_clip_id = None
         state.selected_track = None
         update_inspector()
@@ -668,23 +867,52 @@ def main(page: ft.Page) -> None:
 
     def save_click(_e):
         try:
-            save_project(state.project, str(root / "project.json"))
-            snack("บันทึก project.json แล้ว")
+            path = state.project_path or str(root / "project.json")
+            save_project(state.project, path)
+            state.project_path = path
+            cfg.add_recent_project(path)
+            _mark_saved()
+            _refresh_recent_menu()
+            snack(f"Saved: {Path(path).name}")
+            page.update()
         except Exception as ex:
-            snack(f"บันทึกล้มเหลว: {ex}")
+            snack(f"Save failed: {ex}")
+
+    def save_as_click(_e):
+        async def _save_as() -> None:
+            default_name = Path(state.project_path).name if state.project_path else "project.json"
+            out_path = await file_picker.save_file(
+                file_name=default_name,
+                file_type=ft.FilePickerFileType.CUSTOM,
+                allowed_extensions=["json"],
+            )
+            if not out_path:
+                return
+            try:
+                save_project(state.project, out_path)
+                state.project_path = out_path
+                cfg.add_recent_project(out_path)
+                _mark_saved()
+                _refresh_recent_menu()
+                snack(f"Saved: {Path(out_path).name}")
+                page.update()
+            except Exception as ex:
+                snack(f"Save failed: {ex}")
+
+        page.run_task(_save_as)
 
     def load_click(_e):
-        try:
-            new_project = load_project(str(root / "project.json"))
-            _history_record("Load project.json")
-            state.project = new_project
-            state.selected_clip_id = None
-            state.selected_track = None
-            snack("โหลด project.json แล้ว")
-            update_inspector()
-            refresh_timeline()
-        except Exception as ex:
-            snack(f"โหลดล้มเหลว: {ex}")
+        async def _pick() -> None:
+            picked = await file_picker.pick_files(
+                allow_multiple=False,
+                file_type=ft.FilePickerFileType.CUSTOM,
+                allowed_extensions=["json"],
+            )
+            if not picked or not picked[0].path:
+                return
+            _open_project(picked[0].path)
+
+        page.run_task(_pick)
 
     def export_click(_e):
         if not state.project.v_clips:
@@ -759,7 +987,9 @@ def main(page: ft.Page) -> None:
             ft.ElevatedButton("Split", icon=ft.Icons.CONTENT_CUT, on_click=split_click),
             ft.OutlinedButton("Delete", icon=ft.Icons.DELETE, on_click=delete_click),
             ft.OutlinedButton("Save", icon=ft.Icons.SAVE, on_click=save_click),
+            ft.OutlinedButton("Save As", icon=ft.Icons.SAVE_AS, on_click=save_as_click),
             ft.OutlinedButton("Load", icon=ft.Icons.FOLDER_OPEN, on_click=load_click),
+            recent_menu,
             ft.Container(expand=True),
             export_audio_mode,
             ft.FilledButton("Export", icon=ft.Icons.OUTPUT, on_click=export_click),
@@ -795,6 +1025,7 @@ def main(page: ft.Page) -> None:
                 ft.Divider(height=8),
                 split_label,
                 split_slider,
+                trim_row,
                 audio_controls,
                 audio_pos,
                 ft.Text("Tip: เลือกคลิปแล้วกด Split", size=12, color=ft.Colors.WHITE70),
@@ -837,6 +1068,26 @@ def main(page: ft.Page) -> None:
     refresh_media()
     refresh_timeline()
     update_inspector()
+
+    async def _auto_save_loop() -> None:
+        while True:
+            await asyncio.sleep(cfg.auto_save_interval_sec())
+            if not state.dirty:
+                continue
+            path = state.project_path
+            if not path:
+                continue
+            try:
+                save_project(state.project, path)
+                cfg.add_recent_project(path)
+                _mark_saved()
+                _refresh_recent_menu()
+                page.update()
+            except Exception as ex:
+                log.exception("auto-save failed: %s", ex)
+                snack(f"Auto-save failed: {ex}")
+
+    page.run_task(_auto_save_loop)
 
 
 if __name__ == "__main__":

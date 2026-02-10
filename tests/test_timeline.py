@@ -1,7 +1,7 @@
 import unittest
 
 from core.model import Clip, new_id
-from core.timeline import move_clip_before, split_clip, total_duration
+from core.timeline import move_clip_before, split_clip, total_duration, trim_clip
 
 
 class TestTimeline(unittest.TestCase):
@@ -25,6 +25,19 @@ class TestTimeline(unittest.TestCase):
         a = Clip(id="a", src="a.mp4", in_sec=0, out_sec=1.5)
         b = Clip(id="b", src="b.mp4", in_sec=2, out_sec=5)
         self.assertAlmostEqual(total_duration([a, b]), 4.5)
+
+    def test_trim_clip(self):
+        c = Clip(id="c", src="a.mp4", in_sec=0.0, out_sec=10.0)
+        out, msg = trim_clip([c], "c", 2.0, 7.0)
+        self.assertEqual(msg, "Trimmed")
+        self.assertAlmostEqual(out[0].in_sec, 2.0)
+        self.assertAlmostEqual(out[0].out_sec, 7.0)
+
+    def test_trim_clip_invalid(self):
+        c = Clip(id="c", src="a.mp4", in_sec=0.0, out_sec=10.0)
+        out, msg = trim_clip([c], "c", 5.0, 5.01)
+        self.assertEqual(out[0].in_sec, 0.0)
+        self.assertIn("Trim failed", msg)
 
 
 if __name__ == "__main__":
