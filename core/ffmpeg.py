@@ -92,7 +92,9 @@ def probe_media(ffprobe_path: str, src: str) -> MediaInfo:
         "-show_streams",
         src,
     ]
-    p = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    # ffprobe outputs JSON as UTF-8. On Thai Windows consoles the default
+    # codepage can cause decode errors, so force UTF-8 here.
+    p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", check=True)
     data = json.loads(p.stdout)
 
     fmt = data.get("format", {}) or {}

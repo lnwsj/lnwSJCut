@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import subprocess
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import List, Optional
@@ -997,7 +998,7 @@ def main(page: ft.Page) -> None:
                 ft.Stack(
                     [
                         block,
-                        ft.Positioned(
+                        ft.Container(
                             left=0,
                             top=0,
                             right=0,
@@ -1028,7 +1029,7 @@ def main(page: ft.Page) -> None:
                 ft.Stack(
                     [
                         block,
-                        ft.Positioned(
+                        ft.Container(
                             left=0,
                             top=0,
                             right=0,
@@ -1382,6 +1383,264 @@ def main(page: ft.Page) -> None:
     refresh_media()
     refresh_timeline()
     update_inspector()
+
+    system_test_enabled = os.environ.get("MINICUT_SYSTEM_TEST", "0") == "1"
+
+    def _choose_demo_files(demo_dir: Path) -> List[Path]:
+        files = sorted([p for p in demo_dir.glob("*.mp4") if p.is_file()])
+        if len(files) < 2:
+            return files[:2]
+        # Prefer numbered clips if present.
+        p1 = next((p for p in files if "_1_" in p.name), None)
+        p2 = next((p for p in files if "_2_" in p.name), None)
+        if p1 and p2:
+            return [p1, p2]
+        return files[:2]
+
+    def _take_active_window_screenshot(tag: str) -> Optional[str]:
+        """
+        Capture the current active window to the default screenshot location and
+        rename it to include `tag`. Best-effort: requires screenshot skill helper.
+        """
+        script = Path.home() / ".codex" / "skills" / "screenshot" / "scripts" / "take_screenshot.ps1"
+        if not script.exists():
+            return None
+        try:
+            p = subprocess.run(
+                ["powershell", "-ExecutionPolicy", "Bypass", "-File", str(script), "-ActiveWindow"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=True,
+            )
+        except Exception:
+            log.exception("screenshot failed")
+            return None
+
+        out = (p.stdout or "").strip().splitlines()
+        if not out:
+            return None
+        src = Path(out[-1].strip())
+        if not src.exists():
+            return None
+
+        safe_tag = "".join(ch if ch.isalnum() or ch in ("_", "-") else "_" for ch in str(tag))
+        dest = src.with_name(f"minicut_{safe_tag}_{src.name}")
+        try:
+            if dest.exists():
+                dest = src.with_name(f"minicut_{safe_tag}_{src.stem}_{os.getpid()}{src.suffix}")
+            src.rename(dest)
+            return str(dest)
+        except Exception:
+            return str(src)
+
+    async def _run_system_test() -> None:
+        # Give the window time to appear.
+        await asyncio.sleep(1.0)
+
+        shots: List[str] = []
+        async def _try_window(coro, timeout_sec: float = 1.2) -> None:
+            try:
+                await asyncio.wait_for(coro, timeout=timeout_sec)
+            except Exception:
+                return
+
+        async def _shot(tag: str) -> None:
+            try:
+                page.window.focused = True
+            except Exception:
+                pass
+            page.update()
+            await _try_window(page.window.to_front())
+            await asyncio.sleep(0.25)
+            p = _take_active_window_screenshot(tag)
+            if p:
+                shots.append(p)
+
+        try:
+            try:
+                page.window.always_on_top = True
+            except Exception:
+                pass
+
+            try:
+                page.window.focused = True
+            except Exception:
+                pass
+            page.update()
+            await _try_window(page.window.center())
+            await _try_window(page.window.to_front())
+            await asyncio.sleep(0.8)
+
+            await _shot("01_start")
+
+            demo_dir = Path(os.environ.get("MINICUT_SYSTEM_TEST_DIR", r"C:\Users\sj88s\Videos\000001"))
+            demo_files = _choose_demo_files(demo_dir)
+            if len(demo_files) < 2:
+                snack(f"System test: not enough mp4 files in {demo_dir}")
+                return
+
+            bins = get_bins()
+            if not bins:
+                return
+            ffmpeg, ffprobe = bins
+
+            # Import media into Media Bin.
+            for src in demo_files:
+                if any(m.path == str(src) for m in state.media):
+                    continue
+                info = probe_media(ffprobe, str(src))
+                state.media.append(
+                    MediaItem(
+                        path=str(src),
+                        duration=info.duration,
+                        has_video=info.has_video,
+                        has_audio=info.has_audio,
+                        width=info.width,
+                        height=info.height,
+                        fps=info.fps,
+                        video_codec=info.video_codec,
+                        audio_codec=info.audio_codec,
+                        video_bitrate=info.video_bitrate,
+                        audio_bitrate=info.audio_bitrate,
+                        file_size_bytes=info.file_size_bytes,
+                        pixel_format=info.pixel_format,
+                        sample_rate=info.sample_rate,
+                        channels=info.channels,
+                    )
+                )
+            refresh_media()
+            await asyncio.sleep(0.6)
+            await _shot("02_imported")
+
+            # Add both files to V1 timeline.
+            for src in demo_files:
+                mi = next((m for m in state.media if m.path == str(src)), None)
+                if not mi:
+                    continue
+                state.project.v_clips = add_clip_end(state.project.v_clips, mi.path, mi.duration)
+            _mark_dirty()
+            refresh_timeline()
+
+            # Select first clip for inspector visibility.
+            if state.project.v_clips:
+                state.selected_track = "v"
+                state.selected_clip_id = state.project.v_clips[0].id
+            update_inspector()
+            await asyncio.sleep(0.6)
+            await _shot("03_on_timeline")
+
+            # Split each clip in half and keep the first half.
+            for i, src in enumerate(demo_files, start=1):
+                clip = next((c for c in state.project.v_clips if c.src == str(src)), None)
+                if not clip:
+                    continue
+
+                state.selected_track = "v"
+                state.selected_clip_id = clip.id
+                update_inspector()
+                refresh_timeline()
+                await asyncio.sleep(0.5)
+                await _shot(f"04_clip{i}_selected")
+
+                # Split at half: update_inspector() already sets the slider to half.
+                split_click(None)
+                await asyncio.sleep(0.5)
+                await _shot(f"05_clip{i}_split")
+
+                # Delete the second half (the clip right after the selected first piece).
+                clips = state.project.v_clips
+                idx = next((k for k, c in enumerate(clips) if c.id == state.selected_clip_id), None)
+                if idx is not None and idx + 1 < len(clips):
+                    state.selected_track = "v"
+                    state.selected_clip_id = clips[idx + 1].id
+                    update_inspector()
+                    delete_click(None)
+                    await asyncio.sleep(0.5)
+                await _shot(f"06_clip{i}_kept_first")
+
+            # Export result (no file picker).
+            out_path = os.environ.get(
+                "MINICUT_SYSTEM_TEST_OUT",
+                str(demo_dir / "minicut_export_test.mp4"),
+            )
+            out_file = Path(out_path)
+            try:
+                out_file.parent.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+
+            exporting = ft.AlertDialog(
+                modal=False,
+                title=ft.Text("System test export"),
+                content=ft.Text("Exporting..."),
+            )
+            page.show_dialog(exporting)
+            await asyncio.sleep(0.6)
+            await _shot("07_exporting")
+
+            v_clips = list(state.project.v_clips)
+            a_clips = list(state.project.a_clips)
+            audio_mode = state.export_audio_mode
+            try:
+                await asyncio.to_thread(
+                    export_project,
+                    ffmpeg,
+                    ffprobe,
+                    v_clips,
+                    a_clips,
+                    out_path,
+                    audio_mode=audio_mode,
+                )
+                ok = True
+                err = ""
+            except Exception as ex:
+                ok = False
+                err = str(ex)
+
+            size_bytes = 0
+            if ok:
+                try:
+                    size_bytes = out_file.stat().st_size
+                except Exception:
+                    size_bytes = 0
+
+            exporting.content = ft.Text(
+                "Export done\n"
+                f"Path: {out_path}\n"
+                f"Size: {_fmt_bytes(size_bytes)}\n\n"
+                f"Screenshots:\n" + "\n".join(shots)
+                if ok
+                else f"Export failed: {err}"
+            )
+            exporting.actions = [ft.TextButton("Close", on_click=lambda _e: page.pop_dialog())]
+            page.update()
+            await asyncio.sleep(0.8)
+            await _shot("08_export_done")
+
+            # Close the app after a short delay to keep screenshots visible.
+            await asyncio.sleep(1.5)
+            try:
+                await page.window.close()
+            except Exception:
+                pass
+        except Exception:
+            log.exception("system test failed")
+        finally:
+            # Ensure the process terminates even if the window close doesn't.
+            await asyncio.sleep(0.8)
+            try:
+                await _try_window(page.window.close(), timeout_sec=1.0)
+            except Exception:
+                pass
+            try:
+                os._exit(0)
+            except Exception:
+                pass
+
+    if system_test_enabled:
+        page.run_task(_run_system_test)
 
     async def _auto_save_loop() -> None:
         while True:
