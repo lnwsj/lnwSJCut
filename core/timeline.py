@@ -112,6 +112,22 @@ def move_clip_before(clips: List[Clip], moving_id: str, target_id: str) -> List[
     return out
 
 
+def duplicate_clip(clips: List[Clip], clip_id: str) -> Tuple[List[Clip], Optional[str], str]:
+    """Duplicate a clip and insert it right after the original."""
+    out: List[Clip] = []
+    new_id_val: Optional[str] = None
+    for c in clips:
+        out.append(c)
+        if c.id == clip_id:
+            dup = replace(c, id=new_id())
+            out.append(dup)
+            new_id_val = dup.id
+
+    if new_id_val is None:
+        return clips, None, "ไม่พบคลิปที่จะ Duplicate"
+    return out, new_id_val, "Duplicate แล้ว"
+
+
 def total_duration(clips: List[Clip]) -> float:
     return sum(c.dur for c in clips)
 

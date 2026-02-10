@@ -25,6 +25,8 @@ class Clip:
     src: str
     in_sec: float
     out_sec: float
+    volume: float = 1.0
+    muted: bool = False
 
     @property
     def dur(self) -> float:
@@ -44,6 +46,8 @@ class Clip:
             src=str(d["src"]),
             in_sec=float(d["in_sec"]),
             out_sec=float(d["out_sec"]),
+            volume=float(d.get("volume", 1.0) or 1.0),
+            muted=bool(d.get("muted", False)),
         )
 
 

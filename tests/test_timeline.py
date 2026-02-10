@@ -1,7 +1,7 @@
 import unittest
 
 from core.model import Clip, new_id
-from core.timeline import move_clip_before, split_clip, total_duration, trim_clip
+from core.timeline import duplicate_clip, move_clip_before, split_clip, total_duration, trim_clip
 
 
 class TestTimeline(unittest.TestCase):
@@ -38,6 +38,18 @@ class TestTimeline(unittest.TestCase):
         out, msg = trim_clip([c], "c", 5.0, 5.01)
         self.assertEqual(out[0].in_sec, 0.0)
         self.assertIn("Trim failed", msg)
+
+    def test_duplicate_clip(self):
+        a = Clip(id="a", src="a.mp4", in_sec=0, out_sec=1)
+        b = Clip(id="b", src="b.mp4", in_sec=0, out_sec=1)
+        out, new_id_val, msg = duplicate_clip([a, b], "a")
+        self.assertIn("Duplicate", msg)
+        self.assertIsNotNone(new_id_val)
+        self.assertEqual([x.id for x in out][0], "a")
+        self.assertEqual([x.id for x in out][2], "b")
+        self.assertEqual(out[1].src, "a.mp4")
+        self.assertNotEqual(out[1].id, "a")
+        self.assertEqual(out[1].id, new_id_val)
 
 
 if __name__ == "__main__":

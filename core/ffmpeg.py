@@ -16,6 +16,17 @@ class MediaInfo:
     duration: float
     has_video: bool
     has_audio: bool
+    width: int = 0
+    height: int = 0
+    fps: float = 0.0
+    video_codec: str = ""
+    audio_codec: str = ""
+    video_bitrate: int = 0
+    audio_bitrate: int = 0
+    file_size_bytes: int = 0
+    pixel_format: str = ""
+    sample_rate: int = 0
+    channels: int = 0
 
 
 class FFmpegNotFound(RuntimeError):
@@ -87,11 +98,89 @@ def probe_media(ffprobe_path: str, src: str) -> MediaInfo:
     fmt = data.get("format", {}) or {}
     dur = float(fmt.get("duration", 0.0) or 0.0)
 
+    file_size_bytes = 0
+    try:
+        file_size_bytes = int(fmt.get("size", 0) or 0)
+    except Exception:
+        file_size_bytes = 0
+    if not file_size_bytes:
+        try:
+            file_size_bytes = Path(src).stat().st_size
+        except Exception:
+            file_size_bytes = 0
+
     streams = data.get("streams", []) or []
     has_v = any(s.get("codec_type") == "video" for s in streams)
     has_a = any(s.get("codec_type") == "audio" for s in streams)
 
-    return MediaInfo(duration=dur, has_video=has_v, has_audio=has_a)
+    width = 0
+    height = 0
+    fps = 0.0
+    video_codec = ""
+    audio_codec = ""
+    video_bitrate = 0
+    audio_bitrate = 0
+    pixel_format = ""
+    sample_rate = 0
+    channels = 0
+
+    def _ratio_to_fps(v: str) -> float:
+        try:
+            num, den = str(v or "0/1").split("/")
+            den_f = float(den)
+            return float(num) / den_f if den_f else 0.0
+        except Exception:
+            return 0.0
+
+    for s in streams:
+        if s.get("codec_type") == "video" and not video_codec:
+            try:
+                width = int(s.get("width", 0) or 0)
+            except Exception:
+                width = 0
+            try:
+                height = int(s.get("height", 0) or 0)
+            except Exception:
+                height = 0
+
+            fps = _ratio_to_fps(s.get("r_frame_rate") or s.get("avg_frame_rate") or "0/1")
+            video_codec = str(s.get("codec_name", "") or "")
+            pixel_format = str(s.get("pix_fmt", "") or "")
+            try:
+                video_bitrate = int(s.get("bit_rate", 0) or 0)
+            except Exception:
+                video_bitrate = 0
+        elif s.get("codec_type") == "audio" and not audio_codec:
+            audio_codec = str(s.get("codec_name", "") or "")
+            try:
+                sample_rate = int(s.get("sample_rate", 0) or 0)
+            except Exception:
+                sample_rate = 0
+            try:
+                channels = int(s.get("channels", 0) or 0)
+            except Exception:
+                channels = 0
+            try:
+                audio_bitrate = int(s.get("bit_rate", 0) or 0)
+            except Exception:
+                audio_bitrate = 0
+
+    return MediaInfo(
+        duration=dur,
+        has_video=has_v,
+        has_audio=has_a,
+        width=width,
+        height=height,
+        fps=fps,
+        video_codec=video_codec,
+        audio_codec=audio_codec,
+        video_bitrate=video_bitrate,
+        audio_bitrate=audio_bitrate,
+        file_size_bytes=file_size_bytes,
+        pixel_format=pixel_format,
+        sample_rate=sample_rate,
+        channels=channels,
+    )
 
 
 def build_export_command(ffmpeg_path: str, clips: List[Clip], out_path: str) -> List[str]:
@@ -125,9 +214,18 @@ def build_export_command(ffmpeg_path: str, clips: List[Clip], out_path: str) -> 
         parts.append(
             f"[{idx}:v]trim=start={c.in_sec}:end={c.out_sec},setpts=PTS-STARTPTS[{v}]"
         )
-        parts.append(
-            f"[{idx}:a]atrim=start={c.in_sec}:end={c.out_sec},asetpts=PTS-STARTPTS[{a}]"
-        )
+        vol = max(0.0, float(getattr(c, "volume", 1.0) or 1.0))
+        muted = bool(getattr(c, "muted", False))
+        if muted:
+            parts.append(
+                f"anullsrc=channel_layout=stereo:sample_rate=48000,"
+                f"atrim=start=0:end={c.dur},asetpts=PTS-STARTPTS[{a}]"
+            )
+        else:
+            parts.append(
+                f"[{idx}:a]atrim=start={c.in_sec}:end={c.out_sec},asetpts=PTS-STARTPTS,"
+                f"aformat=sample_rates=48000:channel_layouts=stereo,volume={vol:.2f}[{a}]"
+            )
         seg_labels.append(f"[{v}][{a}]")
 
     parts.append(f"{''.join(seg_labels)}concat=n={len(clips)}:v=1:a=1[v][a]")
@@ -218,10 +316,12 @@ def build_export_command_project(
 
         if need_v1_audio:
             a = f"va{i}"
-            if infos[c.src].has_audio:
+            vol = max(0.0, float(getattr(c, "volume", 1.0) or 1.0))
+            muted = bool(getattr(c, "muted", False))
+            if infos[c.src].has_audio and not muted:
                 parts.append(
                     f"[{idx}:a]atrim=start={c.in_sec}:end={c.out_sec},asetpts=PTS-STARTPTS,"
-                    f"aformat=sample_rates=48000:channel_layouts=stereo[{a}]"
+                    f"aformat=sample_rates=48000:channel_layouts=stereo,volume={vol:.2f}[{a}]"
                 )
             else:
                 # Silence segment matching the clip duration.
@@ -244,10 +344,18 @@ def build_export_command_project(
         for j, c in enumerate(a_clips):
             idx = src_to_idx[c.src]
             a = f"a{j}"
-            parts.append(
-                f"[{idx}:a]atrim=start={c.in_sec}:end={c.out_sec},asetpts=PTS-STARTPTS,"
-                f"aformat=sample_rates=48000:channel_layouts=stereo[{a}]"
-            )
+            vol = max(0.0, float(getattr(c, "volume", 1.0) or 1.0))
+            muted = bool(getattr(c, "muted", False))
+            if muted:
+                parts.append(
+                    f"anullsrc=channel_layout=stereo:sample_rate=48000,"
+                    f"atrim=start=0:end={c.dur},asetpts=PTS-STARTPTS[{a}]"
+                )
+            else:
+                parts.append(
+                    f"[{idx}:a]atrim=start={c.in_sec}:end={c.out_sec},asetpts=PTS-STARTPTS,"
+                    f"aformat=sample_rates=48000:channel_layouts=stereo,volume={vol:.2f}[{a}]"
+                )
             a_seg_labels.append(f"[{a}]")
         parts.append(f"{''.join(a_seg_labels)}concat=n={len(a_clips)}:v=0:a=1[a_a1]")
 

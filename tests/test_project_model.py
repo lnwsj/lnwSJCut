@@ -16,10 +16,12 @@ class TestProjectModel(unittest.TestCase):
         self.assertEqual(len(p.v_clips), 1)
         self.assertEqual(len(p.a_clips), 0)
         self.assertEqual(p.v_clips[0].src, "a.mp4")
+        self.assertAlmostEqual(p.v_clips[0].volume, 1.0)
+        self.assertFalse(p.v_clips[0].muted)
 
     def test_roundtrip_new_format(self):
-        v = Clip(id="v1", src="a.mp4", in_sec=0.0, out_sec=2.0)
-        a = Clip(id="a1", src="b.mp3", in_sec=1.0, out_sec=3.0)
+        v = Clip(id="v1", src="a.mp4", in_sec=0.0, out_sec=2.0, volume=0.5, muted=False)
+        a = Clip(id="a1", src="b.mp3", in_sec=1.0, out_sec=3.0, volume=1.0, muted=True)
         p = Project(v_clips=[v], a_clips=[a], fps=24)
 
         d = p.to_dict()
@@ -31,8 +33,11 @@ class TestProjectModel(unittest.TestCase):
         self.assertEqual(len(p2.v_clips), 1)
         self.assertEqual(len(p2.a_clips), 1)
         self.assertEqual(p2.a_clips[0].src, "b.mp3")
+        self.assertAlmostEqual(p2.v_clips[0].volume, 0.5)
+        self.assertFalse(p2.v_clips[0].muted)
+        self.assertAlmostEqual(p2.a_clips[0].volume, 1.0)
+        self.assertTrue(p2.a_clips[0].muted)
 
 
 if __name__ == "__main__":
     unittest.main()
-

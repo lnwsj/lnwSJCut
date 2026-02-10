@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import List, Optional
 
@@ -18,6 +18,7 @@ from core.model import Project
 from core.project_io import load_project, save_project
 from core.timeline import (
     add_clip_end,
+    duplicate_clip,
     insert_clip_before,
     move_clip_before,
     split_clip,
@@ -36,12 +37,65 @@ def _fmt_time(sec: float) -> str:
     return f"{m:02d}:{s:05.2f}"
 
 
+def _fmt_bytes(n: int) -> str:
+    try:
+        n = int(n)
+    except Exception:
+        return "-"
+    if n <= 0:
+        return "-"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    v = float(n)
+    u = 0
+    while v >= 1024.0 and u < len(units) - 1:
+        v /= 1024.0
+        u += 1
+    return f"{v:.1f} {units[u]}"
+
+
+def _fmt_bps(bps: int) -> str:
+    try:
+        bps = int(bps)
+    except Exception:
+        return "-"
+    if bps <= 0:
+        return "-"
+    if bps >= 1_000_000:
+        return f"{bps / 1_000_000:.2f} Mbps"
+    return f"{bps / 1000:.0f} Kbps"
+
+
+def _channels_label(ch: int) -> str:
+    try:
+        ch = int(ch)
+    except Exception:
+        return ""
+    if ch == 1:
+        return "mono"
+    if ch == 2:
+        return "stereo"
+    if ch > 2:
+        return f"{ch} ch"
+    return ""
+
+
 @dataclass
 class MediaItem:
     path: str
     duration: float
     has_video: bool
     has_audio: bool
+    width: int = 0
+    height: int = 0
+    fps: float = 0.0
+    video_codec: str = ""
+    audio_codec: str = ""
+    video_bitrate: int = 0
+    audio_bitrate: int = 0
+    file_size_bytes: int = 0
+    pixel_format: str = ""
+    sample_rate: int = 0
+    channels: int = 0
 
 
 class AppState:
@@ -247,6 +301,8 @@ def main(page: ft.Page) -> None:
             export_click(None)
         elif ctrl and key == "i":
             import_click(None)
+        elif ctrl and key == "d":
+            duplicate_click(None)
         elif key in ("+", "=", "add"):
             try:
                 timeline_zoom.value = min(180, float(timeline_zoom.value) + 10)
@@ -270,10 +326,53 @@ def main(page: ft.Page) -> None:
     # ---------- Media Bin ----------
     media_list = ft.ListView(expand=True, spacing=4, auto_scroll=False)
 
+    def _media_info_text(it: MediaItem) -> str:
+        name = Path(it.path).name
+        lines: List[str] = [name, f"Duration: {_fmt_time(it.duration)}", f"File size: {_fmt_bytes(it.file_size_bytes)}"]
+
+        if it.has_video:
+            res = f"{it.width}x{it.height}" if it.width and it.height else "-"
+            fps = f"{it.fps:.2f} fps" if it.fps else "-"
+            vc = it.video_codec or "-"
+            pf = it.pixel_format or "-"
+            vb = _fmt_bps(it.video_bitrate)
+            lines.append(f"Video: {vc} ({pf})")
+            lines.append(f"Resolution: {res} | FPS: {fps} | Bitrate: {vb}")
+        else:
+            lines.append("Video: -")
+
+        if it.has_audio:
+            ac = it.audio_codec or "-"
+            sr = f"{it.sample_rate} Hz" if it.sample_rate else "-"
+            ch = _channels_label(it.channels) or "-"
+            ab = _fmt_bps(it.audio_bitrate)
+            lines.append(f"Audio: {ac} | {sr} | {ch} | Bitrate: {ab}")
+        else:
+            lines.append("Audio: -")
+
+        lines.append(f"Path: {it.path}")
+        return "\n".join(lines)
+
+    def _show_media_info(it: MediaItem) -> None:
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Media Info"),
+            content=ft.Container(
+                width=560,
+                padding=10,
+                content=ft.Text(_media_info_text(it), selectable=True),
+            ),
+            actions=[ft.TextButton("Close", on_click=lambda _e: page.pop_dialog())],
+        )
+        page.show_dialog(dlg)
+
     def refresh_media() -> None:
         media_list.controls.clear()
         for it in state.media:
             icon = ft.Icons.MOVIE if it.has_video else ft.Icons.AUDIOTRACK
+            tooltip = f"{Path(it.path).name}\n{_fmt_time(it.duration)}"
+            if it.has_video and it.width and it.height:
+                tooltip += f"\n{it.width}x{it.height}"
             media_list.controls.append(
                 ft.Draggable(
                     group="tl",
@@ -283,11 +382,17 @@ def main(page: ft.Page) -> None:
                         padding=8,
                         border_radius=8,
                         bgcolor=ft.Colors.BLUE_GREY_800,
+                        tooltip=tooltip,
                         content=ft.Row(
                             [
                                 ft.Icon(icon),
                                 ft.Text(Path(it.path).name, expand=True, no_wrap=True),
                                 ft.Text(_fmt_time(it.duration)),
+                                ft.IconButton(
+                                    ft.Icons.INFO_OUTLINE,
+                                    tooltip="Media info",
+                                    on_click=lambda _e, it=it: _show_media_info(it),
+                                ),
                             ],
                             tight=True,
                         ),
@@ -299,6 +404,78 @@ def main(page: ft.Page) -> None:
     file_picker = ft.FilePicker()
 
     recent_menu = ft.PopupMenuButton(icon=ft.Icons.HISTORY, tooltip="Recent projects", items=[])
+
+    # ---------- File Drop Import (OS -> Media Bin) ----------
+    allowed_import_ext = {
+        ".mp4",
+        ".mov",
+        ".mkv",
+        ".avi",
+        ".webm",
+        ".flv",
+        ".wmv",
+        ".m4v",
+        ".mp3",
+        ".wav",
+        ".flac",
+        ".aac",
+        ".ogg",
+        ".m4a",
+    }
+
+    def on_file_drop(e) -> None:
+        files = getattr(e, "files", None) or []
+        if not files:
+            return
+
+        bins = get_bins()
+        if not bins:
+            return
+        _, ffprobe = bins
+
+        added = 0
+        for f in files:
+            path = getattr(f, "path", None)
+            if not path:
+                continue
+            ext = Path(path).suffix.lower()
+            if ext not in allowed_import_ext:
+                continue
+            if any(m.path == path for m in state.media):
+                continue
+            try:
+                info = probe_media(ffprobe, path)
+                if info.duration <= 0.01:
+                    continue
+                state.media.append(
+                    MediaItem(
+                        path=path,
+                        duration=info.duration,
+                        has_video=info.has_video,
+                        has_audio=info.has_audio,
+                        width=info.width,
+                        height=info.height,
+                        fps=info.fps,
+                        video_codec=info.video_codec,
+                        audio_codec=info.audio_codec,
+                        video_bitrate=info.video_bitrate,
+                        audio_bitrate=info.audio_bitrate,
+                        file_size_bytes=info.file_size_bytes,
+                        pixel_format=info.pixel_format,
+                        sample_rate=info.sample_rate,
+                        channels=info.channels,
+                    )
+                )
+                added += 1
+            except Exception as ex:
+                log.exception("probe failed: %s", ex)
+
+        if added:
+            snack(f"Imported {added} file(s)")
+            refresh_media()
+
+    # Best-effort: Flet desktop supports dropping files from OS.
+    page.on_drop = on_file_drop
 
     def _open_project(path: str) -> None:
         try:
@@ -394,6 +571,23 @@ def main(page: ft.Page) -> None:
 
     trim_apply = ft.FilledButton("Apply Trim", icon=ft.Icons.CUT, on_click=trim_click)
     trim_row = ft.Row([trim_in, trim_out, trim_apply], visible=False, spacing=6)
+
+    # ---------- Clip audio controls (export-time) ----------
+    volume_title = ft.Text("Audio", weight=ft.FontWeight.BOLD, size=12)
+    volume_value = ft.Text("1.00x", size=12, color=ft.Colors.WHITE70)
+    volume_slider = ft.Slider(min=0.0, max=3.0, value=1.0, divisions=300, round=2)
+    mute_checkbox = ft.Checkbox(label="Mute", value=False)
+    audio_edit_panel = ft.Column(
+        [
+            volume_title,
+            ft.Row([ft.Text("Volume", size=12), ft.Container(expand=True), volume_value], tight=True),
+            volume_slider,
+            mute_checkbox,
+        ],
+        visible=False,
+        spacing=4,
+        tight=True,
+    )
 
     preview_host = ft.Container(
         height=260,
@@ -518,6 +712,68 @@ def main(page: ft.Page) -> None:
     if audio_preview_enabled and audio is not None:
         audio.on_position_change = on_audio_position
 
+    def _set_selected_clip_audio(volume: Optional[float] = None, muted: Optional[bool] = None, label: str = "Audio") -> None:
+        clip = _selected_clip()
+        track = state.selected_track
+        if not clip or track not in ("v", "a"):
+            return
+
+        before = _track_clips(track)
+        out = []
+        changed = False
+        for c in before:
+            if c.id != clip.id:
+                out.append(c)
+                continue
+            updates = {}
+            if volume is not None:
+                updates["volume"] = float(volume)
+            if muted is not None:
+                updates["muted"] = bool(muted)
+            nc = replace(c, **updates) if updates else c
+            out.append(nc)
+            changed = changed or (nc != c)
+
+        if not changed:
+            return
+        _history_record(f"{label} {clip.name}")
+        _set_track_clips(track, out)
+        _mark_dirty()
+        update_inspector()
+        refresh_timeline()
+
+    def on_volume_change(e: ft.ControlEvent) -> None:
+        try:
+            volume_value.value = f"{float(e.control.value):.2f}x"
+        except Exception:
+            volume_value.value = "-"
+        volume_value.update()
+
+    def on_volume_change_end(e: ft.ControlEvent) -> None:
+        clip = _selected_clip()
+        if not clip:
+            return
+        try:
+            v = float(e.control.value)
+        except Exception:
+            return
+        if abs(float(getattr(clip, "volume", 1.0)) - v) < 1e-6:
+            return
+        _set_selected_clip_audio(volume=v, label="Volume")
+
+    def on_mute_change(e: ft.ControlEvent) -> None:
+        clip = _selected_clip()
+        if not clip:
+            return
+        m = bool(e.control.value)
+        if bool(getattr(clip, "muted", False)) == m:
+            return
+        _set_selected_clip_audio(muted=m, label="Mute")
+
+    volume_slider.on_change = on_volume_change
+    volume_slider.on_change_end = on_volume_change_end
+    mute_checkbox.on_change = on_mute_change
+
     def update_inspector() -> None:
         clip = _selected_clip()
         if not clip:
@@ -533,6 +789,7 @@ def main(page: ft.Page) -> None:
             trim_in.value = ""
             trim_out.value = ""
             trim_row.visible = False
+            audio_edit_panel.visible = False
             audio_controls.visible = False
             audio_pos.visible = False
             _stop_audio_to_clip_start()
@@ -546,6 +803,14 @@ def main(page: ft.Page) -> None:
         trim_in.value = _fmt_time(clip.in_sec)
         trim_out.value = _fmt_time(clip.out_sec)
         trim_row.visible = True
+        audio_edit_panel.visible = True
+
+        try:
+            volume_slider.value = float(getattr(clip, "volume", 1.0) or 1.0)
+        except Exception:
+            volume_slider.value = 1.0
+        mute_checkbox.value = bool(getattr(clip, "muted", False))
+        volume_value.value = f"{float(volume_slider.value):.2f}x"
 
         split_slider.min = 0
         split_slider.max = max(0.01, clip.dur)
@@ -794,7 +1059,22 @@ def main(page: ft.Page) -> None:
             picked = await file_picker.pick_files(
                 allow_multiple=True,
                 file_type=ft.FilePickerFileType.CUSTOM,
-                allowed_extensions=["mp4", "mov", "mkv", "mp3", "wav", "m4a", "aac", "flac", "ogg"],
+                allowed_extensions=[
+                    "mp4",
+                    "mov",
+                    "mkv",
+                    "avi",
+                    "webm",
+                    "flv",
+                    "wmv",
+                    "m4v",
+                    "mp3",
+                    "wav",
+                    "flac",
+                    "aac",
+                    "ogg",
+                    "m4a",
+                ],
             )
             if not picked:
                 return
@@ -807,6 +1087,8 @@ def main(page: ft.Page) -> None:
             for f in picked:
                 if not f.path:
                     continue
+                if any(m.path == f.path for m in state.media):
+                    continue
                 try:
                     info = probe_media(ffprobe, f.path)
                     if info.duration <= 0.01:
@@ -817,6 +1099,17 @@ def main(page: ft.Page) -> None:
                             duration=info.duration,
                             has_video=info.has_video,
                             has_audio=info.has_audio,
+                            width=info.width,
+                            height=info.height,
+                            fps=info.fps,
+                            video_codec=info.video_codec,
+                            audio_codec=info.audio_codec,
+                            video_bitrate=info.video_bitrate,
+                            audio_bitrate=info.audio_bitrate,
+                            file_size_bytes=info.file_size_bytes,
+                            pixel_format=info.pixel_format,
+                            sample_rate=info.sample_rate,
+                            channels=info.channels,
                         )
                     )
                 except Exception as ex:
@@ -844,6 +1137,25 @@ def main(page: ft.Page) -> None:
         _set_track_clips(state.selected_track, clips)
         if clips != before:
             _mark_dirty()
+        snack(msg)
+        update_inspector()
+        refresh_timeline()
+
+    def duplicate_click(_e):
+        if not state.selected_track or not state.selected_clip_id:
+            snack("เลือกคลิปก่อน")
+            return
+
+        before = _track_clips(state.selected_track)
+        selected = _find_clip(state.selected_track, state.selected_clip_id)
+        clips, new_id_val, msg = duplicate_clip(before, state.selected_clip_id)
+        if clips != before:
+            _history_record(f"Duplicate {selected.name if selected else 'clip'}")
+            _set_track_clips(state.selected_track, clips)
+            if new_id_val:
+                state.selected_clip_id = new_id_val
+            _mark_dirty()
+
         snack(msg)
         update_inspector()
         refresh_timeline()
@@ -985,6 +1297,7 @@ def main(page: ft.Page) -> None:
             undo_btn,
             redo_btn,
             ft.ElevatedButton("Split", icon=ft.Icons.CONTENT_CUT, on_click=split_click),
+            ft.OutlinedButton("Duplicate", icon=ft.Icons.CONTENT_COPY, on_click=duplicate_click),
             ft.OutlinedButton("Delete", icon=ft.Icons.DELETE, on_click=delete_click),
             ft.OutlinedButton("Save", icon=ft.Icons.SAVE, on_click=save_click),
             ft.OutlinedButton("Save As", icon=ft.Icons.SAVE_AS, on_click=save_as_click),
@@ -1026,6 +1339,7 @@ def main(page: ft.Page) -> None:
                 split_label,
                 split_slider,
                 trim_row,
+                audio_edit_panel,
                 audio_controls,
                 audio_pos,
                 ft.Text("Tip: เลือกคลิปแล้วกด Split", size=12, color=ft.Colors.WHITE70),
