@@ -21,6 +21,8 @@ dist/
 
 # Runtime outputs
 project.json
+run_stdout*.txt
+run_stderr*.txt
 
 # Media files (usually large; keep out of git)
 *.mp4
@@ -44,4 +46,3 @@ bin/ffprobe
 Thumbs.db
 .vscode/
 .idea/
-

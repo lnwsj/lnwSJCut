@@ -109,12 +109,20 @@ class AppState:
         self.selected_clip_id: Optional[str] = None
         self.px_per_sec: float = 60.0  # timeline zoom
         self.export_audio_mode: str = "mix"  # "mix" | "a1_only" | "v1_only"
+        # Split marker time (seconds) for the currently selected clip.
+        self.split_pos_sec: float = 0.0
+        self.split_pos_clip_id: Optional[str] = None
 
 
 def main(page: ft.Page) -> None:
     page.title = "MiniCut (MVP)"
-    page.window.width = 1100
-    page.window.height = 720
+    # Window sizing is desktop-only. In web mode it can lead to awkward clipping where the
+    # timeline panel isn't visible in the browser viewport.
+    _platform = str(getattr(page, "platform", "") or "").lower()
+    is_web = bool(getattr(page, "web", False)) or ("web" in _platform)
+    if not is_web:
+        page.window.width = 1100
+        page.window.height = 720
     page.theme_mode = ft.ThemeMode.DARK
     page.padding = 10
 
@@ -590,8 +598,9 @@ def main(page: ft.Page) -> None:
         tight=True,
     )
 
+    # Keep the preview reasonably small so the timeline stays visible in typical browser heights.
     preview_host = ft.Container(
-        height=260,
+        height=200,
         border_radius=10,
         bgcolor=ft.Colors.BLACK,
         # Some Flet versions don't expose `ft.alignment.*`; Alignment(x, y) is stable.
@@ -787,6 +796,8 @@ def main(page: ft.Page) -> None:
             split_slider.min = 0
             split_slider.max = 1
             split_slider.value = 0.5
+            state.split_pos_clip_id = None
+            state.split_pos_sec = 0.0
             trim_in.value = ""
             trim_out.value = ""
             trim_row.visible = False
@@ -815,20 +826,29 @@ def main(page: ft.Page) -> None:
 
         split_slider.min = 0
         split_slider.max = max(0.01, clip.dur)
-        split_slider.value = min(clip.dur / 2, max(0.01, clip.dur - 0.01))
-        split_label.value = f"Split: {_fmt_time(split_slider.value)}"
+        if state.split_pos_clip_id != clip.id:
+            # Default split position when selecting a new clip.
+            state.split_pos_clip_id = clip.id
+            state.split_pos_sec = min(clip.dur / 2, max(0.01, clip.dur - 0.01))
+        state.split_pos_sec = max(0.0, min(clip.dur, float(state.split_pos_sec)))
+        split_slider.value = state.split_pos_sec
+        split_label.value = f"Split: {_fmt_time(state.split_pos_sec)}"
 
         if state.selected_track == "v":
             audio_controls.visible = False
             audio_pos.visible = False
             _stop_audio_to_clip_start()
-            preview_host.content = ftv.Video(
-                expand=True,
-                playlist=[ftv.VideoMedia(clip.src)],
-                autoplay=False,
-                muted=True,
-                show_controls=True,
-            )
+            if is_web:
+                # Browser can't reliably play local file paths; keep web UI lightweight.
+                preview_host.content = ft.Text("Preview disabled in browser mode", color=ft.Colors.WHITE70)
+            else:
+                preview_host.content = ftv.Video(
+                    expand=True,
+                    playlist=[ftv.VideoMedia(clip.src)],
+                    autoplay=False,
+                    muted=True,
+                    show_controls=True,
+                )
         else:
             audio_controls.visible = audio_preview_enabled
             audio_pos.visible = audio_preview_enabled
@@ -847,8 +867,15 @@ def main(page: ft.Page) -> None:
         page.update()
 
     def on_split_slider(e: ft.ControlEvent) -> None:
-        split_label.value = f"Split: {_fmt_time(float(split_slider.value))}"
+        try:
+            val = float(split_slider.value)
+        except Exception:
+            return
+        state.split_pos_sec = val
+        state.split_pos_clip_id = state.selected_clip_id
+        split_label.value = f"Split: {_fmt_time(val)}"
         split_label.update()
+        refresh_timeline()
 
     split_slider.on_change = on_split_slider
 
@@ -875,28 +902,92 @@ def main(page: ft.Page) -> None:
         selected = state.selected_track == track and state.selected_clip_id == clip.id
         label = f"A: {clip.name}" if is_audio else clip.name
 
+        def _select_at(position_px: float | None = None) -> None:
+            state.selected_track = track
+            state.selected_clip_id = clip.id
+            # If user clicked within the clip, set split position to that proportion.
+            if position_px is not None and dur_px > 0 and clip.dur > 0:
+                ratio = max(0.0, min(1.0, position_px / dur_px))
+                state.split_pos_clip_id = clip.id
+                state.split_pos_sec = max(0.0, min(clip.dur, clip.dur * ratio))
+            update_inspector()
+            refresh_timeline()
+
+        dragging = {"active": False}
+
+        def on_tap_down(e: ft.TapEvent):
+            try:
+                px = float(getattr(e, "local_x", None) or 0.0)
+            except Exception:
+                px = None
+            _select_at(px)
+
+        def on_pan_start(e: ft.DragStartEvent):
+            dragging["active"] = True
+            try:
+                px = float(getattr(e, "local_x", None) or 0.0)
+            except Exception:
+                px = None
+            _select_at(px)
+
+        def on_pan_update(e: ft.DragUpdateEvent):
+            if not dragging["active"]:
+                return
+            try:
+                px = float(getattr(e, "local_x", None) or 0.0)
+            except Exception:
+                px = None
+            _select_at(px)
+
+        def on_pan_end(_e: ft.DragEndEvent):
+            dragging["active"] = False
+
+        block_height = 28 if is_audio else 36
         cont = ft.Container(
             width=dur_px,
-            height=28 if is_audio else 36,
+            height=block_height,
             padding=6,
             border_radius=8,
             bgcolor=ft.Colors.AMBER_600 if selected else color,
             content=ft.Text(label, size=12, no_wrap=True),
         )
 
-        def on_click(_e):
-            state.selected_track = track
-            state.selected_clip_id = clip.id
-            update_inspector()
-            refresh_timeline()
+        content_with_gesture = ft.GestureDetector(
+            on_tap=lambda _e: _select_at(),
+            on_tap_down=on_tap_down,
+            on_pan_start=on_pan_start,
+            on_pan_update=on_pan_update,
+            on_pan_end=on_pan_end,
+            content=cont,
+        )
 
-        cont.on_click = on_click
+        stack_children = [content_with_gesture]
+        if selected and clip.dur > 0:
+            try:
+                play_px = max(0.0, min(dur_px, (float(split_slider.value) / clip.dur) * dur_px))
+            except Exception:
+                play_px = None
+            if play_px is not None:
+                stack_children.append(
+                    ft.Container(
+                        left=play_px,
+                        top=0,
+                        bottom=0,
+                        width=2,
+                        bgcolor=ft.Colors.RED_400,
+                        opacity=0.9,
+                    )
+                )
 
         return ft.Draggable(
             group="tl",
             data={"kind": "clip", "track": track, "id": clip.id},
             axis=ft.Axis.HORIZONTAL,
-            content=cont,
+            content=ft.Stack(
+                controls=stack_children,
+                width=dur_px,
+                height=block_height,
+            ),
             content_feedback=ft.Container(width=80, height=22, bgcolor=ft.Colors.WHITE24, border_radius=8),
         )
 
@@ -993,27 +1084,14 @@ def main(page: ft.Page) -> None:
                         handle_drop("v", target_id, payload)
                 return _on_accept
 
+            width = max(70, int(c.dur * state.px_per_sec))
             block = clip_block("v", c.id)
-            v_row.controls.append(
-                ft.Stack(
-                    [
-                        block,
-                        ft.Container(
-                            left=0,
-                            top=0,
-                            right=0,
-                            bottom=0,
-                            content=ft.DragTarget(
-                                group="tl",
-                                on_accept=_make_on_accept_v(c.id),
-                                content=ft.Container(bgcolor=ft.Colors.TRANSPARENT),
-                            ),
-                        ),
-                    ],
-                    width=max(70, int(c.dur * state.px_per_sec)),
-                    height=40,
-                )
+            drop_zone = ft.DragTarget(
+                group="tl",
+                on_accept=_make_on_accept_v(c.id),
+                content=ft.Container(width=8, height=40, bgcolor=ft.Colors.TRANSPARENT),
             )
+            v_row.controls.append(ft.Row(spacing=0, controls=[drop_zone, ft.Container(width=width, content=block)]))
 
         # A1 clips
         for c in state.project.a_clips:
@@ -1024,27 +1102,14 @@ def main(page: ft.Page) -> None:
                         handle_drop("a", target_id, payload)
                 return _on_accept
 
+            width = max(70, int(c.dur * state.px_per_sec))
             block = clip_block("a", c.id)
-            a_row.controls.append(
-                ft.Stack(
-                    [
-                        block,
-                        ft.Container(
-                            left=0,
-                            top=0,
-                            right=0,
-                            bottom=0,
-                            content=ft.DragTarget(
-                                group="tl",
-                                on_accept=_make_on_accept_a(c.id),
-                                content=ft.Container(bgcolor=ft.Colors.TRANSPARENT),
-                            ),
-                        ),
-                    ],
-                    width=max(70, int(c.dur * state.px_per_sec)),
-                    height=34,
-                )
+            drop_zone = ft.DragTarget(
+                group="tl",
+                on_accept=_make_on_accept_a(c.id),
+                content=ft.Container(width=8, height=34, bgcolor=ft.Colors.TRANSPARENT),
             )
+            a_row.controls.append(ft.Row(spacing=0, controls=[drop_zone, ft.Container(width=width, content=block)]))
 
         v_row.controls.append(_end_drop("v", height=36))
         a_row.controls.append(_end_drop("a", height=28))
@@ -1331,7 +1396,8 @@ def main(page: ft.Page) -> None:
         padding=10,
         border_radius=12,
         bgcolor=ft.Colors.BLUE_GREY_900,
-        content=ft.Column(
+        expand=True,
+        content=ft.ListView(
             [
                 ft.Text("Inspector", weight=ft.FontWeight.BOLD),
                 selected_title,
@@ -1345,25 +1411,38 @@ def main(page: ft.Page) -> None:
                 audio_pos,
                 ft.Text("Tip: เลือกคลิปแล้วกด Split", size=12, color=ft.Colors.WHITE70),
             ],
-            tight=True,
+            spacing=6,
+            expand=True,
         ),
     )
 
-    right_panel = ft.Column(
-        [
-            ft.Text("Preview", weight=ft.FontWeight.BOLD),
-            preview_host,
-            ft.Divider(height=8),
-            inspector,
-        ],
-        expand=True,
-        spacing=8,
-    )
+    right_panel_items: List[ft.Control] = []
+    if not is_web:
+        right_panel_items.extend(
+            [
+                ft.Text("Preview", weight=ft.FontWeight.BOLD),
+                preview_host,
+                ft.Divider(height=8),
+            ]
+        )
+    right_panel_items.append(inspector)
 
-    main_row = ft.Row([left_panel, ft.VerticalDivider(width=8), right_panel], expand=True)
+    right_panel = ft.Column(right_panel_items, expand=True, spacing=8)
+
+    # On web, we observed cases where the main row content could overflow and visually cover the
+    # fixed-height timeline panel. Clip the main area so the timeline is always visible.
+    main_row = ft.Container(
+        # Web viewport heights vary a lot; using a fixed height keeps the timeline visible
+        # without relying on page scroll behavior.
+        expand=not is_web,
+        height=440 if is_web else None,
+        clip_behavior=ft.ClipBehavior.HARD_EDGE,
+        content=ft.Row([left_panel, ft.VerticalDivider(width=8), right_panel], expand=True),
+    )
 
     timeline = ft.Container(
         padding=10,
+        height=180,
         border_radius=12,
         bgcolor=ft.Colors.BLUE_GREY_900,
         content=ft.Column(
@@ -1379,12 +1458,28 @@ def main(page: ft.Page) -> None:
 
     page.add(ft.Column([toolbar, main_row, timeline], expand=True, spacing=10))
 
+    system_test_enabled = os.environ.get("MINICUT_SYSTEM_TEST", "0") == "1"
+
     # initial
     refresh_media()
     refresh_timeline()
     update_inspector()
 
-    system_test_enabled = os.environ.get("MINICUT_SYSTEM_TEST", "0") == "1"
+    # Convenience: auto-open the default project file on startup.
+    # Skip in system-test mode to keep tests deterministic.
+    if not system_test_enabled and state.project_path:
+        try:
+            default_project = Path(state.project_path)
+        except Exception:
+            default_project = None
+        if default_project and default_project.exists():
+            _open_project(str(default_project))
+            # Make split UX obvious: select the first clip if nothing is selected.
+            if state.project.v_clips and not state.selected_clip_id:
+                state.selected_track = "v"
+                state.selected_clip_id = state.project.v_clips[0].id
+                update_inspector()
+                refresh_timeline()
 
     def _choose_demo_files(demo_dir: Path) -> List[Path]:
         files = sorted([p for p in demo_dir.glob("*.mp4") if p.is_file()])
