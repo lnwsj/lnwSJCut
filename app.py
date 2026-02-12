@@ -122,6 +122,12 @@ class AppState:
         self.playhead_sec: float = 0.0  # global timeline seconds on the active video timeline track
         self.playhead_clip_id: Optional[str] = None
         self.is_playing: bool = False
+        # Timeline snap/grid
+        self.snap_enabled: bool = True
+        self.snap_to_grid: bool = True
+        self.snap_to_edges: bool = True
+        self.snap_grid_sec: float = 0.5
+        self.snap_threshold_px: float = 12.0
 
 
 def main(page: ft.Page) -> None:
@@ -167,7 +173,7 @@ def main(page: ft.Page) -> None:
             content=playhead_bar,
         ),
     )
-    timeline_header_h = 70.0
+    timeline_header_h = 116.0
     playhead_line = ft.Container(left=0, top=timeline_header_h, content=playhead_handle)
     preview_video: Optional[ftv.Video] = None
     preview_video_src: Optional[str] = None
@@ -302,6 +308,74 @@ def main(page: ft.Page) -> None:
 
     def _timeline_video_clips():
         return list(_timeline_video_track().clips)
+
+    def _timeline_video_total_sec() -> float:
+        return max(0.0, total_duration(_timeline_video_clips()))
+
+    def _timeline_sec_to_position(sec: float) -> tuple[Optional[str], float, float]:
+        clips = _timeline_video_clips()
+        if not clips:
+            return None, 0.0, 0.0
+        s = max(0.0, min(float(sec), _timeline_video_total_sec()))
+        acc = 0.0
+        for c in clips:
+            end = acc + float(c.dur)
+            if s <= end + 1e-9:
+                rel = max(0.0, min(float(c.dur), s - acc))
+                return c.id, s, rel
+            acc = end
+        last = clips[-1]
+        return last.id, _timeline_video_total_sec(), float(last.dur)
+
+    def _timeline_edge_points_sec() -> List[float]:
+        clips = _timeline_video_clips()
+        points: List[float] = [0.0]
+        acc = 0.0
+        for c in clips:
+            points.append(acc)
+            acc += float(c.dur)
+            points.append(acc)
+        if acc > 0.0:
+            points.append(acc)
+        return points
+
+    def _snap_sec(sec: float) -> tuple[float, Optional[str]]:
+        if not bool(state.snap_enabled):
+            return float(sec), None
+
+        total = _timeline_video_total_sec()
+        s = max(0.0, min(float(sec), total))
+        threshold_sec = max(0.0, float(state.snap_threshold_px)) / max(1.0, float(state.px_per_sec))
+
+        best = s
+        best_dist = float("inf")
+        best_kind: Optional[str] = None
+
+        if bool(state.snap_to_edges):
+            for p in _timeline_edge_points_sec():
+                d = abs(float(p) - s)
+                if d < best_dist:
+                    best = float(p)
+                    best_dist = d
+                    best_kind = "edge"
+
+        if bool(state.snap_to_grid):
+            try:
+                step = float(state.snap_grid_sec)
+            except Exception:
+                step = 0.5
+            if step > 0:
+                grid = round(s / step) * step
+                grid = max(0.0, min(grid, total))
+                d = abs(grid - s)
+                if d < best_dist:
+                    best = float(grid)
+                    best_dist = d
+                    best_kind = "grid"
+
+        if best_dist <= threshold_sec:
+            return best, best_kind
+        return s, None
 
     def _is_selected_video() -> bool:
         return _track_kind(state.selected_track) == "video"
@@ -1505,6 +1579,14 @@ def main(page: ft.Page) -> None:
         if not clip_id:
             return False
 
+        snapped_sec, _snap_kind = _snap_sec(global_sec)
+        if abs(snapped_sec - global_sec) > 1e-9:
+            clip_id2, global_sec2, rel_sec2 = _timeline_sec_to_position(snapped_sec)
+            if clip_id2 is not None:
+                clip_id = clip_id2
+                global_sec = global_sec2
+                rel_sec = rel_sec2
+
         if state.is_playing:
             stop_playback()
 
@@ -1977,6 +2059,20 @@ def main(page: ft.Page) -> None:
             return
         state.split_pos_sec = val
         state.split_pos_clip_id = state.selected_clip_id
+        track_id = state.selected_track
+        if track_id == _timeline_video_track_id() and state.selected_clip_id:
+            start = v_start_sec_map.get(state.selected_clip_id, 0.0)
+            snap_sec, _snap_kind = _snap_sec(start + val)
+            clip_id2, snapped_global_sec, rel2 = _timeline_sec_to_position(snap_sec)
+            if clip_id2 is not None:
+                state.selected_track = _timeline_video_track_id()
+                state.selected_clip_id = clip_id2
+                state.playhead_clip_id = clip_id2
+                state.split_pos_clip_id = clip_id2
+                state.split_pos_sec = rel2
+                split_slider.value = rel2
+                state.playhead_sec = snapped_global_sec
+                val = rel2
         split_label.value = f"Split: {_fmt_time(val)}"
         split_label.update()
         # Move playhead to match split slider position.
@@ -1999,6 +2095,30 @@ def main(page: ft.Page) -> None:
     # ---------- Timeline ----------
     timeline_zoom = ft.Slider(min=20, max=180, value=state.px_per_sec, divisions=160)
     timeline_info = ft.Text("Timeline: 0 clips", size=12, color=ft.Colors.WHITE70)
+    timeline_ruler_row = ft.Row(spacing=0, scroll=ft.ScrollMode.AUTO)
+    snap_threshold_label = ft.Text(f"{int(state.snap_threshold_px)}px", size=11, color=ft.Colors.WHITE70)
+    snap_enable_sw = ft.Switch(label="Snap", value=state.snap_enabled)
+    snap_edges_cb = ft.Checkbox(label="Edges", value=state.snap_to_edges)
+    snap_grid_cb = ft.Checkbox(label="Grid", value=state.snap_to_grid)
+    snap_grid_dd = ft.Dropdown(
+        label="Step",
+        width=94,
+        dense=True,
+        value=f"{state.snap_grid_sec:g}",
+        options=[
+            ft.dropdown.Option(key="0.25", text="0.25s"),
+            ft.dropdown.Option(key="0.5", text="0.5s"),
+            ft.dropdown.Option(key="1", text="1s"),
+            ft.dropdown.Option(key="2", text="2s"),
+        ],
+    )
+    snap_threshold_slider = ft.Slider(
+        min=4,
+        max=30,
+        value=float(state.snap_threshold_px),
+        divisions=26,
+        width=120,
+    )
 
     timeline_tracks_col = ft.Column(spacing=6, expand=True)
 
@@ -2007,6 +2127,43 @@ def main(page: ft.Page) -> None:
         refresh_timeline()
 
     timeline_zoom.on_change = on_zoom
+
+    def _on_snap_toggle(_e: ft.ControlEvent) -> None:
+        state.snap_enabled = bool(snap_enable_sw.value)
+        refresh_timeline()
+
+    def _on_snap_edges(_e: ft.ControlEvent) -> None:
+        state.snap_to_edges = bool(snap_edges_cb.value)
+        refresh_timeline()
+
+    def _on_snap_grid(_e: ft.ControlEvent) -> None:
+        state.snap_to_grid = bool(snap_grid_cb.value)
+        refresh_timeline()
+
+    def _on_snap_grid_step(_e: ft.ControlEvent) -> None:
+        try:
+            state.snap_grid_sec = max(0.05, float(snap_grid_dd.value))
+        except Exception:
+            state.snap_grid_sec = 0.5
+        refresh_timeline()
+
+    def _on_snap_threshold(_e: ft.ControlEvent) -> None:
+        try:
+            state.snap_threshold_px = float(snap_threshold_slider.value)
+        except Exception:
+            state.snap_threshold_px = 12.0
+        snap_threshold_label.value = f"{int(round(state.snap_threshold_px))}px"
+        try:
+            snap_threshold_label.update()
+        except Exception:
+            pass
+        refresh_timeline()
+
+    snap_enable_sw.on_change = _on_snap_toggle
+    snap_edges_cb.on_change = _on_snap_edges
+    snap_grid_cb.on_change = _on_snap_grid
+    snap_grid_dd.on_change = _on_snap_grid_step
+    snap_threshold_slider.on_change = _on_snap_threshold
 
     def clip_block(track_id: str, clip_id: str) -> ft.Control:
         track = _track_obj(track_id)
@@ -2030,7 +2187,16 @@ def main(page: ft.Page) -> None:
                 state.split_pos_clip_id = clip.id
                 state.split_pos_sec = max(0.0, min(clip.dur, clip.dur * ratio))
                 if track_id == _timeline_video_track_id():
-                    state.playhead_sec = v_start_sec_map.get(clip.id, 0.0) + state.split_pos_sec
+                    raw_global_sec = v_start_sec_map.get(clip.id, 0.0) + state.split_pos_sec
+                    snapped_sec, _snap_kind = _snap_sec(raw_global_sec)
+                    clip_id2, snapped_global_sec, rel2 = _timeline_sec_to_position(snapped_sec)
+                    if clip_id2 is not None:
+                        state.selected_track = _timeline_video_track_id()
+                        state.selected_clip_id = clip_id2
+                        state.playhead_clip_id = clip_id2
+                        state.split_pos_clip_id = clip_id2
+                        state.split_pos_sec = rel2
+                        state.playhead_sec = snapped_global_sec
                 update_playhead_ui()
                 _run_sync_video_to_playhead(resume=False)
             update_inspector()
@@ -2111,9 +2277,15 @@ def main(page: ft.Page) -> None:
 
     def refresh_timeline() -> None:
         timeline_tracks_col.controls.clear()
+        timeline_ruler_row.controls.clear()
         v_start_sec_map.clear()
         v_start_px_map.clear()
         v_clip_width_px_map.clear()
+
+        snap_edges_cb.disabled = not bool(state.snap_enabled)
+        snap_grid_cb.disabled = not bool(state.snap_enabled)
+        snap_grid_dd.disabled = (not bool(state.snap_enabled)) or (not bool(state.snap_to_grid))
+        snap_threshold_slider.disabled = not bool(state.snap_enabled)
 
         def _insert_existing_clip(before, target_id: str, moving_clip):
             out = []
@@ -2307,15 +2479,57 @@ def main(page: ft.Page) -> None:
                 )
             )
 
-        v_total = _fmt_time(total_duration(state.project.primary_video_track().clips))
+        timeline_video_track = _timeline_video_track()
+        v_total = _fmt_time(total_duration(timeline_video_track.clips))
         a_total = _fmt_time(total_duration(state.project.primary_audio_track().clips))
         timeline_info.value = (
             f"Tracks V:{len(state.project.video_tracks)} A:{len(state.project.audio_tracks)} "
-            f"| Clips:{total_clip_count} | {state.project.primary_video_track().name}:{v_total} "
+            f"| Clips:{total_clip_count} | {timeline_video_track.name}:{v_total} "
             f"| {state.project.primary_audio_track().name}:{a_total}"
         )
+
+        total_sec = _timeline_video_total_sec()
+        step = max(0.1, float(state.snap_grid_sec or 0.5))
+        if total_sec <= 0.0:
+            timeline_ruler_row.controls.append(
+                ft.Container(
+                    width=220,
+                    height=18,
+                    border=ft.Border(left=ft.BorderSide(1, ft.Colors.WHITE24)),
+                    content=ft.Text("00:00.00", size=10, color=ft.Colors.WHITE38),
+                )
+            )
+        else:
+            t = 0.0
+            max_marks = 500
+            marks = 0
+            while t <= total_sec + 1e-9 and marks < max_marks:
+                w = max(8, int(step * state.px_per_sec))
+                timeline_ruler_row.controls.append(
+                    ft.Container(
+                        width=w,
+                        height=18,
+                        border=ft.Border(left=ft.BorderSide(1, ft.Colors.WHITE24)),
+                        alignment=ft.Alignment(-1, 0),
+                        padding=ft.padding.only(left=2),
+                        content=ft.Text(_fmt_time(t), size=9, color=ft.Colors.WHITE38),
+                    )
+                )
+                t += step
+                marks += 1
+            # Keep ruler aligned to at least end duration width.
+            remaining = max(0, int(total_sec * state.px_per_sec) - int(marks * step * state.px_per_sec))
+            if remaining > 0:
+                timeline_ruler_row.controls.append(
+                    ft.Container(
+                        width=remaining,
+                        height=18,
+                        border=ft.Border(left=ft.BorderSide(1, ft.Colors.WHITE24)),
+                    )
+                )
+
         nonlocal timeline_total_sec
-        timeline_total_sec = total_duration(state.project.primary_video_track().clips)
+        timeline_total_sec = _timeline_video_total_sec()
         update_playhead_ui()
         page.update()
 
@@ -2452,7 +2666,7 @@ def main(page: ft.Page) -> None:
         selected = _find_clip(state.selected_track, state.selected_clip_id)
         split_at = float(split_slider.value)
         split_global_sec = None
-        if selected and state.selected_track == "v":
+        if selected and state.selected_track == _timeline_video_track_id():
             split_global_sec = v_start_sec_map.get(selected.id, 0.0) + split_at
         clips, new_selected, msg = split_clip(
             before,
@@ -3139,8 +3353,30 @@ def main(page: ft.Page) -> None:
     timeline_content = ft.Column(
         [
             ft.Row([timeline_info, ft.Container(expand=True), ft.Text("Zoom"), timeline_zoom]),
+            ft.Row(
+                [
+                    snap_enable_sw,
+                    snap_edges_cb,
+                    snap_grid_cb,
+                    snap_grid_dd,
+                    ft.Text("Threshold", size=11),
+                    snap_threshold_slider,
+                    snap_threshold_label,
+                ],
+                spacing=6,
+                wrap=True,
+            ),
             timeline_track_controls,
             ft.Divider(height=6),
+            ft.Row(
+                [
+                    ft.Container(width=timeline_lane_label_w),
+                    ft.Container(width=timeline_lane_gap_w),
+                    timeline_ruler_row,
+                ],
+                expand=True,
+                spacing=0,
+            ),
             timeline_tracks_col,
         ],
         expand=True,
@@ -3164,7 +3400,7 @@ def main(page: ft.Page) -> None:
 
     timeline = ft.Container(
         padding=10,
-        height=250,
+        height=300,
         border_radius=12,
         bgcolor=ft.Colors.BLUE_GREY_900,
         content=timeline_surface,
