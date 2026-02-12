@@ -118,6 +118,37 @@ class TestTimeline(unittest.TestCase):
         self.assertEqual(out[0].out_sec, 4.0)
         self.assertEqual(msg, "Trim: no changes")
 
+    def test_trim_clip_allows_custom_min_piece(self):
+        c = Clip(id="c", src="a.mp4", in_sec=0.0, out_sec=10.0)
+        out, msg = trim_clip([c], "c", 5.0, 5.03, min_piece_sec=0.02)
+        self.assertEqual(msg, "Trimmed")
+        self.assertAlmostEqual(out[0].in_sec, 5.0)
+        self.assertAlmostEqual(out[0].out_sec, 5.03)
+
+    def test_trim_clip_preserves_other_fields(self):
+        c = Clip(
+            id="c",
+            src="a.mp4",
+            in_sec=0.0,
+            out_sec=10.0,
+            speed=1.75,
+            volume=0.35,
+            muted=True,
+            has_audio=False,
+            transition_in=Transition(kind="fade", duration=0.4),
+        )
+        out, msg = trim_clip([c], "c", 2.0, 6.0)
+        self.assertEqual(msg, "Trimmed")
+        self.assertAlmostEqual(out[0].in_sec, 2.0)
+        self.assertAlmostEqual(out[0].out_sec, 6.0)
+        self.assertAlmostEqual(out[0].speed, 1.75)
+        self.assertAlmostEqual(out[0].volume, 0.35)
+        self.assertTrue(out[0].muted)
+        self.assertFalse(out[0].has_audio)
+        self.assertIsNotNone(out[0].transition_in)
+        self.assertEqual(out[0].transition_in.kind, "fade")
+        self.assertAlmostEqual(out[0].transition_in.duration, 0.4)
+
     def test_duplicate_clip(self):
         a = Clip(id="a", src="a.mp4", in_sec=0, out_sec=1)
         b = Clip(id="b", src="b.mp4", in_sec=0, out_sec=1)

@@ -958,6 +958,16 @@ def main(page: ft.Page) -> None:
     trim_in = ft.TextField(label="In", width=110, dense=True, hint_text="mm:ss")
     trim_out = ft.TextField(label="Out", width=110, dense=True, hint_text="mm:ss")
     trim_hint = ft.Text("", size=11, color=ft.Colors.WHITE70)
+    trim_range = ft.RangeSlider(
+        start_value=0.0,
+        end_value=1.0,
+        min=0.0,
+        max=1.0,
+        divisions=100,
+        visible=False,
+    )
+    trim_range_hint = ft.Text("", size=11, color=ft.Colors.WHITE70)
+    trim_slider_programmatic = False
 
     def _text_input_focus_on(_e: ft.ControlEvent) -> None:
         nonlocal typing_shortcuts_blocked
@@ -980,6 +990,76 @@ def main(page: ft.Page) -> None:
             except Exception:
                 return None
         return None
+
+    def _set_trim_slider_state(
+        source_duration: Optional[float],
+        in_sec: float,
+        out_sec: float,
+        *,
+        note: str = "",
+    ) -> None:
+        nonlocal trim_slider_programmatic
+
+        if source_duration is None:
+            trim_range.visible = False
+            trim_range_hint.value = "Range slider unavailable (source duration unknown)."
+            return
+
+        max_sec = float(source_duration)
+        if max_sec <= trim_min_piece_sec + 1e-6:
+            trim_range.visible = False
+            trim_range_hint.value = "Range slider unavailable (source file is too short)."
+            return
+
+        start_sec = max(0.0, min(max_sec, float(in_sec)))
+        end_sec = max(start_sec + trim_min_piece_sec, min(max_sec, float(out_sec)))
+        if end_sec > max_sec:
+            end_sec = max_sec
+            start_sec = max(0.0, end_sec - trim_min_piece_sec)
+
+        divisions = int(round(max_sec / 0.05))
+        divisions = max(1, min(2000, divisions))
+
+        trim_slider_programmatic = True
+        try:
+            trim_range.min = 0.0
+            trim_range.max = max_sec
+            trim_range.divisions = divisions
+            trim_range.start_value = start_sec
+            trim_range.end_value = end_sec
+            trim_range.visible = True
+        finally:
+            trim_slider_programmatic = False
+
+        default_note = (
+            f"Range slider: {_fmt_time(start_sec)} -> {_fmt_time(end_sec)} "
+            "(drag handles and release to apply)."
+        )
+        trim_range_hint.value = note or default_note
+
+    def on_trim_range_change(_e: ft.ControlEvent) -> None:
+        if trim_slider_programmatic:
+            return
+        try:
+            start_sec = float(trim_range.start_value)
+            end_sec = float(trim_range.end_value)
+        except Exception:
+            return
+
+        trim_in.value = _fmt_time(start_sec)
+        trim_out.value = _fmt_time(end_sec)
+        if end_sec <= start_sec + trim_min_piece_sec:
+            trim_range_hint.value = f"Invalid range: length must be > {_fmt_time(trim_min_piece_sec)}."
+        else:
+            trim_range_hint.value = (
+                f"Preview: {_fmt_time(start_sec)} -> {_fmt_time(end_sec)} (release to apply)."
+            )
+        try:
+            trim_in.update()
+            trim_out.update()
+            trim_range_hint.update()
+        except Exception:
+            pass
 
     def _trim_anchor_source_sec(clip) -> float:
         # Anchor trim helpers to the current split/playhead position inside the selected clip.
@@ -1060,6 +1140,20 @@ def main(page: ft.Page) -> None:
             return
         _apply_trim_values(new_in, new_out, action_label="Trim")
 
+    def trim_range_commit(_e=None) -> None:
+        if trim_slider_programmatic:
+            return
+        try:
+            new_in = float(trim_range.start_value)
+            new_out = float(trim_range.end_value)
+        except Exception:
+            return
+        if new_out <= new_in + trim_min_piece_sec:
+            snack(f"Trim slider: ความยาวคลิปต้องมากกว่า {_fmt_time(trim_min_piece_sec)}")
+            update_inspector()
+            return
+        _apply_trim_values(new_in, new_out, action_label="Trim Slider")
+
     def trim_set_in_click(_e=None) -> None:
         clip = _selected_clip()
         if not clip:
@@ -1098,9 +1192,13 @@ def main(page: ft.Page) -> None:
     trim_reset = ft.TextButton("Reset", icon=ft.Icons.RESTART_ALT, on_click=trim_reset_click)
     trim_in.on_submit = trim_click
     trim_out.on_submit = trim_click
+    trim_range.on_change = on_trim_range_change
+    trim_range.on_change_end = trim_range_commit
     trim_row = ft.Column(
         [
             ft.Row([trim_in, trim_out, trim_apply], spacing=6),
+            trim_range,
+            trim_range_hint,
             ft.Row([trim_set_in, trim_set_out, trim_reset], spacing=6),
             trim_hint,
         ],
@@ -2035,7 +2133,7 @@ def main(page: ft.Page) -> None:
     playhead_handle.on_tap_down = on_playhead_tap_down
 
     def update_inspector() -> None:
-        nonlocal preview_video, preview_video_src
+        nonlocal preview_video, preview_video_src, trim_slider_programmatic
 
         def _prepare_web_preview_src(src: str) -> Optional[str]:
             if not is_web:
@@ -2085,6 +2183,17 @@ def main(page: ft.Page) -> None:
             trim_in.value = ""
             trim_out.value = ""
             trim_hint.value = ""
+            trim_slider_programmatic = True
+            try:
+                trim_range.min = 0.0
+                trim_range.max = 1.0
+                trim_range.divisions = 100
+                trim_range.start_value = 0.0
+                trim_range.end_value = 1.0
+                trim_range.visible = False
+            finally:
+                trim_slider_programmatic = False
+            trim_range_hint.value = ""
             trim_row.visible = False
             transition_panel.visible = False
             transition_kind.value = "none"
@@ -2125,6 +2234,7 @@ def main(page: ft.Page) -> None:
         trim_in.value = _fmt_time(clip.in_sec)
         trim_out.value = _fmt_time(clip.out_sec)
         src_dur = _selected_source_duration(clip)
+        _set_trim_slider_state(src_dur, clip.in_sec, clip.out_sec)
         if src_dur is not None:
             trim_hint.value = (
                 f"Source: {_fmt_time(src_dur)} | Clip: {_fmt_time(clip.dur)} @ {clip_speed:.2f}x "
