@@ -3,12 +3,12 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import List, Optional, Tuple
 
-from .model import Clip, new_id
+from .model import Clip, new_id, transition_overlap_sec
 
 
-def add_clip_end(clips: List[Clip], src: str, duration: float) -> List[Clip]:
+def add_clip_end(clips: List[Clip], src: str, duration: float, has_audio: bool = True) -> List[Clip]:
     """Append a full-length clip to the end of the timeline."""
-    c = Clip(id=new_id(), src=src, in_sec=0.0, out_sec=float(duration))
+    c = Clip(id=new_id(), src=src, in_sec=0.0, out_sec=float(duration), has_audio=bool(has_audio))
     return [*clips, c]
 
 
@@ -17,9 +17,10 @@ def insert_clip_before(
     before_clip_id: str,
     src: str,
     duration: float,
+    has_audio: bool = True,
 ) -> List[Clip]:
     """Insert a full-length clip before another clip by id."""
-    new_clip = Clip(id=new_id(), src=src, in_sec=0.0, out_sec=float(duration))
+    new_clip = Clip(id=new_id(), src=src, in_sec=0.0, out_sec=float(duration), has_audio=bool(has_audio))
     out: List[Clip] = []
     inserted = False
     for c in clips:
@@ -85,6 +86,34 @@ def split_clip(
     return out, new_selected, msg
 
 
+def split_clip_at_timeline_sec(
+    clips: List[Clip],
+    timeline_sec: float,
+    min_piece_sec: float = 0.08,
+) -> Tuple[List[Clip], Optional[str], str]:
+    """
+    Split the clip that intersects a global linear timeline time.
+
+    The timeline is treated as a simple sum of clip durations (no gaps).
+    """
+    if not clips:
+        return clips, None, "Track is empty"
+
+    t = float(timeline_sec)
+    if t < 0.0:
+        return clips, None, "Split position is out of range"
+
+    acc = 0.0
+    for c in clips:
+        start = acc
+        end = acc + float(c.dur)
+        if t <= end + 1e-9:
+            rel = t - start
+            return split_clip(clips, c.id, rel, min_piece_sec=min_piece_sec)
+        acc = end
+    return clips, None, "Split position is out of range"
+
+
 def move_clip_before(clips: List[Clip], moving_id: str, target_id: str) -> List[Clip]:
     """Move clip `moving_id` to be placed before `target_id`."""
     if moving_id == target_id:
@@ -129,7 +158,16 @@ def duplicate_clip(clips: List[Clip], clip_id: str) -> Tuple[List[Clip], Optiona
 
 
 def total_duration(clips: List[Clip]) -> float:
-    return sum(c.dur for c in clips)
+    if not clips:
+        return 0.0
+    total = 0.0
+    prev: Optional[Clip] = None
+    for c in clips:
+        total += c.dur
+        if prev is not None:
+            total -= transition_overlap_sec(prev, c)
+        prev = c
+    return max(0.0, total)
 
 
 def trim_clip(

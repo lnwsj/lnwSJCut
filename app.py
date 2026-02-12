@@ -27,6 +27,7 @@ from core.timeline import (
     insert_clip_before,
     move_clip_before,
     split_clip,
+    split_clip_at_timeline_sec,
     total_duration,
     trim_clip,
 )
@@ -588,6 +589,8 @@ def main(page: ft.Page) -> None:
             save_click(None)
         elif not ctrl and key == "s":
             split_click(None)
+        elif not ctrl and key == "r":
+            razor_multi_cut_click(None)
         elif not ctrl and key == "i":
             trim_set_in_click(None)
         elif not ctrl and key == "o":
@@ -2658,6 +2661,64 @@ def main(page: ft.Page) -> None:
 
         page.run_task(_pick)
 
+    def razor_multi_cut_click(_e=None):
+        tracks = list(state.project.tracks)
+        if not tracks:
+            snack("Timeline is empty")
+            return
+
+        playhead_sec = max(0.0, float(state.playhead_sec))
+        changes: List[tuple[str, List, Optional[str], Optional[str]]] = []
+        for t in tracks:
+            before = _track_clips(t.id)
+            if not before:
+                continue
+            after, left_id, _msg = split_clip_at_timeline_sec(before, playhead_sec)
+            if after == before:
+                continue
+
+            right_id: Optional[str] = None
+            if left_id:
+                try:
+                    left_idx = next(i for i, c in enumerate(after) if c.id == left_id)
+                except StopIteration:
+                    left_idx = -1
+                if 0 <= left_idx < len(after) - 1:
+                    right_id = after[left_idx + 1].id
+            changes.append((t.id, after, left_id, right_id))
+
+        if not changes:
+            snack("Razor: no clip crosses the playhead")
+            return
+
+        _history_record(f"Razor cut {len(changes)} track(s)")
+        for track_id, after, _left_id, _right_id in changes:
+            _set_track_clips(track_id, after)
+
+        sel_track_id = state.selected_track
+        sel_change = next((x for x in changes if x[0] == sel_track_id), None)
+        if sel_change and sel_change[3]:
+            new_id = sel_change[3]
+            state.selected_clip_id = new_id
+            state.playhead_clip_id = new_id
+            state.split_pos_clip_id = new_id
+            state.split_pos_sec = 0.0
+        elif not state.selected_track:
+            base_track_id = _timeline_video_track_id()
+            base_change = next((x for x in changes if x[0] == base_track_id), None)
+            if base_change and base_change[3]:
+                new_id = base_change[3]
+                state.selected_track = base_track_id
+                state.selected_clip_id = new_id
+                state.playhead_clip_id = new_id
+                state.split_pos_clip_id = new_id
+                state.split_pos_sec = 0.0
+
+        _mark_dirty()
+        snack(f"Razor cut {len(changes)} track(s)")
+        update_inspector()
+        refresh_timeline()
+
     def split_click(_e):
         if not state.selected_track or not state.selected_clip_id:
             snack("เลือกคลิปก่อน")
@@ -3253,6 +3314,12 @@ def main(page: ft.Page) -> None:
             undo_btn,
             redo_btn,
             ft.ElevatedButton("Split", icon=ft.Icons.CONTENT_CUT, on_click=split_click),
+            ft.OutlinedButton(
+                "Razor",
+                icon=ft.Icons.CONTENT_CUT,
+                tooltip="Cut all tracks at playhead (R)",
+                on_click=razor_multi_cut_click,
+            ),
             ft.OutlinedButton("Duplicate", icon=ft.Icons.CONTENT_COPY, on_click=duplicate_click),
             ft.OutlinedButton("Delete", icon=ft.Icons.DELETE, on_click=delete_click),
             ft.OutlinedButton("Save", icon=ft.Icons.SAVE, on_click=save_click),
@@ -3309,7 +3376,7 @@ def main(page: ft.Page) -> None:
                 audio_edit_panel,
                 audio_controls,
                 audio_pos,
-                ft.Text("Tip: เลือกคลิปแล้วกด Split", size=12, color=ft.Colors.WHITE70),
+                ft.Text("Tip: Split (S) | Razor all tracks (R)", size=12, color=ft.Colors.WHITE70),
             ],
             spacing=6,
             expand=True,
