@@ -16,7 +16,14 @@ import flet_audio as fta
 import flet_video as ftv
 
 from core.config import ConfigStore
-from core.ffmpeg import FFmpegNotFound, export_project, export_project_with_progress, probe_media, resolve_ffmpeg_bins
+from core.ffmpeg import (
+    FFmpegNotFound,
+    ExportCancelled,
+    export_project,
+    export_project_with_progress,
+    probe_media,
+    resolve_ffmpeg_bins,
+)
 from core.history import HistoryEntry, HistoryManager
 from core.model import MAX_CLIP_SPEED, MIN_CLIP_SPEED, ExportSettings, Project, Transition, normalize_speed
 from core.project_io import load_project, save_project
@@ -3426,6 +3433,23 @@ def main(page: ft.Page) -> None:
                     color=ft.Colors.WHITE70,
                 )
                 progress_bar = ft.ProgressBar(value=0.0, width=420)
+                cancel_requested = False
+                cancel_btn = ft.TextButton("Cancel Export")
+
+                def _request_cancel_export(_e=None) -> None:
+                    nonlocal cancel_requested
+                    if cancel_requested:
+                        return
+                    cancel_requested = True
+                    cancel_btn.disabled = True
+                    progress_label.value = "Cancelling export..."
+                    progress_hint.value = "Waiting for ffmpeg to stop..."
+                    try:
+                        page.update()
+                    except Exception:
+                        pass
+
+                cancel_btn.on_click = _request_cancel_export
                 export_dialog = ft.AlertDialog(
                     modal=True,
                     title=ft.Text("Exporting"),
@@ -3439,6 +3463,7 @@ def main(page: ft.Page) -> None:
                         spacing=8,
                         width=460,
                     ),
+                    actions=[cancel_btn],
                 )
                 page.show_dialog(export_dialog)
                 page.update()
@@ -3489,13 +3514,20 @@ def main(page: ft.Page) -> None:
                             audio_mode=audio_mode,
                             export_settings=export_settings,
                             on_progress=lambda current, total: _schedule_progress_update(current, total),
+                            should_cancel=lambda: bool(cancel_requested),
                             tracks=tracks,
                         )
                         ok = True
+                        cancelled = False
+                        err = ""
+                    except ExportCancelled:
+                        ok = False
+                        cancelled = True
                         err = ""
                     except Exception as ex:
                         log.exception("export failed: %s", ex)
                         ok = False
+                        cancelled = False
                         err = str(ex)
 
                     async def _notify() -> None:
@@ -3508,6 +3540,8 @@ def main(page: ft.Page) -> None:
                             pass
                         if ok:
                             snack(f"Export done: {Path(out_path).name}")
+                        elif cancelled:
+                            snack("Export cancelled")
                         else:
                             snack(f"Export failed: {err}")
 

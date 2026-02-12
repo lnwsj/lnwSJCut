@@ -10,15 +10,24 @@ class _FakeProc:
     def __init__(self, stderr_lines, retcode: int = 0):
         self.stderr = iter(stderr_lines)
         self._retcode = int(retcode)
+        self.terminated = False
+        self.killed = False
 
-    def wait(self) -> int:
+    def wait(self, timeout=None) -> int:
         return self._retcode
+
+    def terminate(self) -> None:
+        self.terminated = True
+
+    def kill(self) -> None:
+        self.killed = True
 
 
 class TestFFmpegExportProgress(unittest.TestCase):
     def test_parse_ffmpeg_progress_seconds(self):
         self.assertAlmostEqual(parse_ffmpeg_progress_seconds("out_time_ms=1500000"), 1.5, places=3)
         self.assertAlmostEqual(parse_ffmpeg_progress_seconds("out_time_us=250000"), 0.25, places=3)
+        self.assertAlmostEqual(parse_ffmpeg_progress_seconds("out_time=00:01:02.500000"), 62.5, places=3)
         self.assertAlmostEqual(
             parse_ffmpeg_progress_seconds("frame=120 fps=24.0 q=23.0 time=00:00:02.34 bitrate=1200kbits/s"),
             2.34,
@@ -134,6 +143,40 @@ class TestFFmpegExportProgress(unittest.TestCase):
 
         self.assertEqual(events[0], (0.0, 3.0))
         self.assertEqual(events[-1], (3.0, 3.0))
+
+    @patch("core.ffmpeg.subprocess.Popen")
+    @patch("core.ffmpeg.build_export_command_project")
+    def test_export_project_with_progress_can_cancel(self, build_cmd, popen):
+        from core.ffmpeg import ExportCancelled
+
+        build_cmd.return_value = ["ffmpeg", "-i", "v.mp4", "out.mp4"]
+        proc = _FakeProc(
+            [
+                "out_time_ms=300000\n",
+                "out_time_ms=900000\n",
+                "out_time_ms=1500000\n",
+            ],
+            retcode=255,
+        )
+        popen.return_value = proc
+
+        v_clips = [Clip(id="v1", src="v.mp4", in_sec=0.0, out_sec=2.0)]
+        calls = {"n": 0}
+
+        def _cancel() -> bool:
+            calls["n"] += 1
+            return calls["n"] >= 2
+
+        with self.assertRaises(ExportCancelled):
+            export_project_with_progress(
+                "ffmpeg",
+                "ffprobe",
+                v_clips,
+                [],
+                "out.mp4",
+                should_cancel=_cancel,
+            )
+        self.assertTrue(proc.terminated or proc.killed)
 
 
 if __name__ == "__main__":

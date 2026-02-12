@@ -37,6 +37,7 @@ class FFmpegNotFound(RuntimeError):
 
 
 _PROGRESS_OUT_TIME_RE = re.compile(r"out_time_(?:ms|us)=(\d+)")
+_PROGRESS_OUT_TIME_HMS_RE = re.compile(r"out_time=(\d+):(\d+):(\d+(?:\.\d+)?)")
 _PROGRESS_TIME_RE = re.compile(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)")
 _AUDIO_BITRATE_RE = re.compile(r"^\d+(?:k|m)$", re.IGNORECASE)
 _X26X_PRESETS = {
@@ -50,6 +51,11 @@ _X26X_PRESETS = {
     "slower",
     "veryslow",
 }
+
+
+class ExportCancelled(RuntimeError):
+    """Raised when export is cancelled by the caller."""
+    pass
 
 
 def _which(name: str, local_bin: Path) -> Optional[str]:
@@ -220,6 +226,16 @@ def parse_ffmpeg_progress_seconds(line: str) -> Optional[float]:
         try:
             # FFmpeg's out_time_ms/out_time_us are microseconds in practice.
             return max(0.0, float(m_out.group(1)) / 1_000_000.0)
+        except Exception:
+            return None
+
+    m_hms = _PROGRESS_OUT_TIME_HMS_RE.search(text)
+    if m_hms:
+        try:
+            hh = float(m_hms.group(1))
+            mm = float(m_hms.group(2))
+            ss = float(m_hms.group(3))
+            return max(0.0, hh * 3600.0 + mm * 60.0 + ss)
         except Exception:
             return None
 
@@ -901,6 +917,7 @@ def export_project_with_progress(
     audio_mode: str = "mix",
     export_settings: Optional[ExportSettings] = None,
     on_progress: Optional[Callable[[float, float], None]] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
     tracks: Optional[List[Track]] = None,
 ) -> None:
     """
@@ -940,8 +957,33 @@ def export_project_with_progress(
     )
 
     last_reported = 0.0
-    if proc.stderr is not None:
+    cancelled = False
+
+    def _cancel_proc() -> None:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
+    if should_cancel:
+        try:
+            if bool(should_cancel()):
+                cancelled = True
+                _cancel_proc()
+        except Exception:
+            pass
+
+    if (not cancelled) and proc.stderr is not None:
         for line in proc.stderr:
+            if should_cancel:
+                try:
+                    if bool(should_cancel()):
+                        cancelled = True
+                        _cancel_proc()
+                        break
+                except Exception:
+                    pass
+
             sec = parse_ffmpeg_progress_seconds(line)
             if sec is None:
                 continue
@@ -964,6 +1006,17 @@ def export_project_with_progress(
                     on_progress(current_sec, total_sec)
                 except Exception:
                     pass
+
+    if cancelled:
+        try:
+            ret = proc.wait(timeout=2.0)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            ret = proc.wait()
+        raise ExportCancelled(f"Export cancelled (ffmpeg exit={ret})")
 
     ret = proc.wait()
     if ret != 0:
