@@ -3,13 +3,67 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import List, Optional, Tuple
 
-from .model import Clip, new_id, normalize_speed, transition_overlap_sec
+from .model import Clip, Transition, new_id, normalize_speed, transition_overlap_sec
+
+_TRANSITION_MIN_SEC = 0.05
+_TRANSITION_KINDS = {"fade", "crossfade", "dissolve"}
+
+
+def _normalize_transitions(clips: List[Clip], min_remaining_sec: float = 0.01) -> List[Clip]:
+    """
+    Keep transition data consistent after timeline edits.
+
+    Rules:
+    - first clip cannot have `transition_in`
+    - unsupported transition kind falls back to `fade`
+    - duration is clamped to what adjacent clip lengths allow
+    - if no legal overlap remains, transition is removed
+    """
+    if not clips:
+        return clips
+
+    out: List[Clip] = []
+    changed = False
+
+    for i, c in enumerate(clips):
+        nc = c
+        trans = getattr(c, "transition_in", None)
+
+        if i == 0:
+            if trans is not None:
+                nc = replace(c, transition_in=None)
+        elif trans is not None:
+            prev = out[i - 1]
+            kind = str(getattr(trans, "kind", "fade") or "fade").strip().lower()
+            if kind not in _TRANSITION_KINDS:
+                kind = "fade"
+            try:
+                req = float(getattr(trans, "duration", 0.0) or 0.0)
+            except Exception:
+                req = 0.0
+
+            max_allowed = max(0.0, min(prev.dur, c.dur) - float(min_remaining_sec))
+            if max_allowed < _TRANSITION_MIN_SEC:
+                nc = replace(c, transition_in=None)
+            else:
+                dur = min(max_allowed, max(_TRANSITION_MIN_SEC, req))
+                if (
+                    str(getattr(trans, "kind", "") or "").strip().lower() != kind
+                    or abs(float(getattr(trans, "duration", 0.0) or 0.0) - dur) > 1e-9
+                ):
+                    nc = replace(c, transition_in=Transition(kind=kind, duration=dur))
+
+        out.append(nc)
+        if nc != c:
+            changed = True
+
+    return out if changed else clips
 
 
 def add_clip_end(clips: List[Clip], src: str, duration: float, has_audio: bool = True) -> List[Clip]:
     """Append a full-length clip to the end of the timeline."""
     c = Clip(id=new_id(), src=src, in_sec=0.0, out_sec=float(duration), has_audio=bool(has_audio))
-    return [*clips, c]
+    return _normalize_transitions([*clips, c])
 
 
 def insert_clip_before(
@@ -30,7 +84,7 @@ def insert_clip_before(
         out.append(c)
     if not inserted:
         out.append(new_clip)
-    return out
+    return _normalize_transitions(out)
 
 
 def find_clip(clips: List[Clip], clip_id: str) -> Optional[Clip]:
@@ -61,6 +115,7 @@ def split_clip(
     out: List[Clip] = []
     msg = ""
     new_selected: Optional[str] = None
+    did_split = False
 
     for c in clips:
         if c.id != clip_id:
@@ -77,13 +132,18 @@ def split_clip(
         speed = normalize_speed(getattr(c, "speed", 1.0), default=1.0)
         mid = c.in_sec + (t * speed)
         c1 = replace(c, id=new_id(), in_sec=c.in_sec, out_sec=mid)
-        c2 = replace(c, id=new_id(), in_sec=mid, out_sec=c.out_sec)
+        # Transition In belongs to the boundary before this clip, so it stays on
+        # the left piece and is removed from the newly created right piece.
+        c2 = replace(c, id=new_id(), in_sec=mid, out_sec=c.out_sec, transition_in=None)
         out.extend([c1, c2])
         new_selected = c1.id
         msg = "Split แล้ว"
+        did_split = True
 
     if not msg:
         msg = "ไม่พบคลิปที่จะ Split"
+    if did_split:
+        out = _normalize_transitions(out)
     return out, new_selected, msg
 
 
@@ -139,7 +199,7 @@ def move_clip_before(clips: List[Clip], moving_id: str, target_id: str) -> List[
         out.append(c)
     if not inserted:
         out.append(moving)
-    return out
+    return _normalize_transitions(out)
 
 
 def duplicate_clip(clips: List[Clip], clip_id: str) -> Tuple[List[Clip], Optional[str], str]:
@@ -149,13 +209,14 @@ def duplicate_clip(clips: List[Clip], clip_id: str) -> Tuple[List[Clip], Optiona
     for c in clips:
         out.append(c)
         if c.id == clip_id:
-            dup = replace(c, id=new_id())
+            # A duplicated clip starts as a clean cut by default.
+            dup = replace(c, id=new_id(), transition_in=None)
             out.append(dup)
             new_id_val = dup.id
 
     if new_id_val is None:
         return clips, None, "ไม่พบคลิปที่จะ Duplicate"
-    return out, new_id_val, "Duplicate แล้ว"
+    return _normalize_transitions(out), new_id_val, "Duplicate แล้ว"
 
 
 def total_duration(clips: List[Clip]) -> float:
@@ -215,4 +276,4 @@ def trim_clip(
         return clips, "Trim failed: clip not found"
     if not changed:
         return clips, "Trim: no changes"
-    return out, "Trimmed"
+    return _normalize_transitions(out), "Trimmed"
