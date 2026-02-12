@@ -300,6 +300,19 @@ def _audio_segment_filter(input_idx: int, clip: Clip, out_label: str, vol: float
     return ",".join(parts)
 
 
+def _clip_has_audio(clip: Clip, source_info: Optional[MediaInfo] = None) -> bool:
+    """
+    Effective audio availability for a clip.
+
+    `clip.has_audio` comes from project metadata; when source probe info exists,
+    require both to be true.
+    """
+    has_audio = bool(getattr(clip, "has_audio", True))
+    if source_info is not None:
+        has_audio = has_audio and bool(source_info.has_audio)
+    return has_audio
+
+
 def _normalize_export_settings(export_settings: Optional[ExportSettings]) -> ExportSettings:
     if export_settings is None:
         raw = ExportSettings()
@@ -480,12 +493,14 @@ def build_export_command(
     clips: List[Clip],
     out_path: str,
     export_settings: Optional[ExportSettings] = None,
+    ffprobe_path: Optional[str] = None,
 ) -> List[str]:
     """
     Build an ffmpeg command to concatenate trimmed segments.
 
-    MVP assumptions:
-    - Each segment has both video+audio streams.
+    Legacy MVP export path.
+    - If `ffprobe_path` is provided, source stream presence is verified and
+      missing audio streams are replaced with generated silence.
     """
     if not clips:
         raise ValueError("Timeline ว่าง")
@@ -502,6 +517,15 @@ def build_export_command(
     for s in srcs:
         args += ["-i", s]
 
+    infos: Dict[str, MediaInfo] = {}
+    if ffprobe_path:
+        for s in srcs:
+            try:
+                infos[s] = probe_media(ffprobe_path, s)
+            except Exception:
+                # Preserve old behavior if probe fails for any source.
+                pass
+
     settings = _normalize_export_settings(export_settings)
     parts: List[str] = []
     v_labels: List[str] = []
@@ -515,7 +539,7 @@ def build_export_command(
         parts.append(_video_segment_filter(idx, c, v))
         vol = max(0.0, float(getattr(c, "volume", 1.0) or 1.0))
         muted = bool(getattr(c, "muted", False))
-        has_audio = bool(getattr(c, "has_audio", True))
+        has_audio = _clip_has_audio(c, infos.get(c.src))
         if muted or not has_audio:
             parts.append(
                 f"anullsrc=channel_layout=stereo:sample_rate=48000,"
@@ -548,8 +572,15 @@ def export_timeline(
     clips: List[Clip],
     out_path: str,
     export_settings: Optional[ExportSettings] = None,
+    ffprobe_path: Optional[str] = None,
 ) -> None:
-    cmd = build_export_command(ffmpeg_path, clips, out_path, export_settings=export_settings)
+    cmd = build_export_command(
+        ffmpeg_path,
+        clips,
+        out_path,
+        export_settings=export_settings,
+        ffprobe_path=ffprobe_path,
+    )
     subprocess.run(cmd, check=True)
 
 
@@ -621,7 +652,7 @@ def _build_export_command_tracks(
 
             vol = max(0.0, float(getattr(c, "volume", 1.0) or 1.0))
             muted = bool(getattr(c, "muted", False)) or bool(t.muted) or (not t.visible)
-            has_audio = bool(getattr(c, "has_audio", True)) and infos[c.src].has_audio
+            has_audio = _clip_has_audio(c, infos[c.src])
             if muted or not has_audio:
                 parts.append(
                     f"anullsrc=channel_layout=stereo:sample_rate=48000,"
@@ -658,7 +689,7 @@ def _build_export_command_tracks(
             a = f"au{ai}_{i}"
             vol = max(0.0, float(getattr(c, "volume", 1.0) or 1.0))
             muted = bool(getattr(c, "muted", False)) or bool(t.muted) or (not t.visible)
-            has_audio = bool(getattr(c, "has_audio", True)) and infos[c.src].has_audio
+            has_audio = _clip_has_audio(c, infos[c.src])
             if muted or not has_audio:
                 parts.append(
                     f"anullsrc=channel_layout=stereo:sample_rate=48000,"
@@ -793,7 +824,7 @@ def build_export_command_project(
             v_audio_labels.append(a)
             vol = max(0.0, float(getattr(c, "volume", 1.0) or 1.0))
             muted = bool(getattr(c, "muted", False))
-            has_audio = bool(getattr(c, "has_audio", True)) and infos[c.src].has_audio
+            has_audio = _clip_has_audio(c, infos[c.src])
             if has_audio and not muted:
                 parts.append(_audio_segment_filter(idx, c, a, vol))
             else:
@@ -823,7 +854,7 @@ def build_export_command_project(
             a = f"a{j}"
             vol = max(0.0, float(getattr(c, "volume", 1.0) or 1.0))
             muted = bool(getattr(c, "muted", False))
-            has_audio = bool(getattr(c, "has_audio", True)) and infos[c.src].has_audio
+            has_audio = _clip_has_audio(c, infos[c.src])
             if muted or not has_audio:
                 parts.append(
                     f"anullsrc=channel_layout=stereo:sample_rate=48000,"

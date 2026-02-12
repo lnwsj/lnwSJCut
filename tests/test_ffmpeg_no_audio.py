@@ -35,6 +35,23 @@ class TestFFmpegNoAudio(unittest.TestCase):
         self.assertIn("anullsrc=channel_layout=stereo:sample_rate=48000", joined)
         self.assertNotIn("[0:a]atrim", joined)
 
+    @patch("core.ffmpeg.probe_media")
+    def test_build_export_command_uses_silence_when_probe_finds_no_audio(self, probe_media):
+        probe_media.return_value = MediaInfo(duration=2.0, has_video=True, has_audio=False)
+        clip = Clip(
+            id="v1",
+            src="unknown_audio.mp4",
+            in_sec=0.0,
+            out_sec=2.0,
+            muted=False,
+            has_audio=True,
+        )
+        cmd = build_export_command("ffmpeg", [clip], "out.mp4", ffprobe_path="ffprobe")
+        joined = " ".join(cmd)
+        self.assertIn("anullsrc=channel_layout=stereo:sample_rate=48000", joined)
+        self.assertNotIn("[0:a]atrim", joined)
+        probe_media.assert_called_once_with("ffprobe", "unknown_audio.mp4")
+
     def test_build_export_command_with_transition_adds_xfade_and_acrossfade(self):
         clips = [
             Clip(id="v1", src="a.mp4", in_sec=0.0, out_sec=2.0),
@@ -80,6 +97,24 @@ class TestFFmpegNoAudio(unittest.TestCase):
         joined = " ".join(cmd)
         self.assertIn("anullsrc=channel_layout=stereo:sample_rate=48000", joined)
         self.assertIn("concat=n=1:v=0:a=1[a_a1]", joined)
+
+    @patch("core.ffmpeg.probe_media")
+    def test_build_export_command_project_v1_uses_silence_when_probe_has_no_audio(self, probe_media):
+        probe_media.return_value = MediaInfo(duration=5.0, has_video=True, has_audio=False)
+        v_clips = [
+            Clip(id="v1", src="v_noaudio.mp4", in_sec=0.0, out_sec=2.0, has_audio=True),
+        ]
+        cmd = build_export_command_project(
+            "ffmpeg",
+            "ffprobe",
+            v_clips,
+            [],
+            "out.mp4",
+            audio_mode="v1_only",
+        )
+        joined = " ".join(cmd)
+        self.assertIn("anullsrc=channel_layout=stereo:sample_rate=48000", joined)
+        self.assertNotIn("[0:a]atrim", joined)
 
     @patch("core.ffmpeg.probe_media")
     def test_build_export_command_project_transition_uses_overlap_duration(self, probe_media):
