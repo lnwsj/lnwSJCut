@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
+import shutil
 import subprocess
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import List, Optional
@@ -112,6 +115,10 @@ class AppState:
         # Split marker time (seconds) for the currently selected clip.
         self.split_pos_sec: float = 0.0
         self.split_pos_clip_id: Optional[str] = None
+        # Playback / playhead
+        self.playhead_sec: float = 0.0  # global timeline seconds on V1
+        self.playhead_clip_id: Optional[str] = None
+        self.is_playing: bool = False
 
 
 def main(page: ft.Page) -> None:
@@ -128,8 +135,43 @@ def main(page: ft.Page) -> None:
 
     root = Path(__file__).resolve().parent
     state = AppState()
+    web_preview_cache: dict[str, str] = {}
     history = HistoryManager(limit=50)
     cfg = ConfigStore.default()
+    playhead_handle_w = 14.0
+    playhead_bar = ft.Column(
+        [
+            ft.Container(width=10, height=10, border_radius=5, bgcolor=ft.Colors.RED_300, opacity=0.95),
+            ft.Container(width=2, height=84, bgcolor=ft.Colors.RED_400, opacity=0.95),
+        ],
+        spacing=0,
+        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+    )
+    playhead_handle = ft.GestureDetector(
+        mouse_cursor=ft.MouseCursor.GRAB,
+        drag_interval=0,
+        content=ft.Container(
+            width=int(playhead_handle_w),
+            height=94,
+            alignment=ft.Alignment(0, 0),
+            bgcolor=ft.Colors.TRANSPARENT,
+            content=playhead_bar,
+        ),
+    )
+    playhead_line = ft.Container(left=0, top=28, content=playhead_handle)
+    preview_video: Optional[ftv.Video] = None
+    v_start_sec_map: dict[str, float] = {}
+    v_start_px_map: dict[str, float] = {}
+    v_clip_width_px_map: dict[str, float] = {}
+    playhead_drag_start_left: float = 0.0
+    playhead_drag_start_pointer_x: float = 0.0
+    timeline_pan_active: bool = False
+    timeline_pan_start_pointer_x: float = 0.0
+    timeline_pan_start_playhead_x: float = 0.0
+    timeline_lane_label_w = 30.0
+    timeline_lane_gap_w = 8.0
+    timeline_v1_left_offset = timeline_lane_label_w + timeline_lane_gap_w
+    timeline_total_sec: float = 0.0
 
     # Default project path keeps existing behavior (single project.json in repo root).
     state.project_path = str(root / "project.json")
@@ -784,7 +826,435 @@ def main(page: ft.Page) -> None:
     volume_slider.on_change_end = on_volume_change_end
     mute_checkbox.on_change = on_mute_change
 
+    def play_click(_e=None):
+        clip = _selected_clip()
+        if not clip or not preview_video:
+            return
+        clip_start = v_start_sec_map.get(clip.id, 0.0)
+        clip_end = clip_start + clip.dur
+        if state.playhead_sec < clip_start or state.playhead_sec > clip_end:
+            state.playhead_sec = clip_start
+        state.is_playing = True
+        state.playhead_clip_id = clip.id
+        _run_sync_video_to_playhead(resume=True)
+        page.run_task(_playhead_loop)
+
+    def pause_click(_e=None):
+        stop_playback()
+
+    def stop_click(_e=None):
+        stop_playback()
+        clip = _selected_clip()
+        if clip:
+            state.playhead_clip_id = clip.id
+            state.playhead_sec = v_start_sec_map.get(clip.id, 0.0)
+            _run_sync_video_to_playhead(resume=False)
+            update_playhead_ui()
+
+    async def _sync_video_to_playhead(resume: bool = False) -> None:
+        nonlocal preview_video
+        if not preview_video:
+            return
+        seek_sec = max(0.0, state.playhead_sec)
+        clip = _selected_clip()
+        if clip and state.playhead_clip_id == clip.id:
+            clip_start = v_start_sec_map.get(clip.id, 0.0)
+            rel = max(0.0, min(clip.dur, state.playhead_sec - clip_start))
+            seek_sec = clip.in_sec + rel
+        try:
+            await preview_video.pause()
+        except Exception:
+            pass
+        try:
+            await preview_video.seek(int(seek_sec * 1000))
+        except Exception:
+            pass
+        if resume:
+            try:
+                await preview_video.play()
+            except Exception:
+                pass
+
+    def _run_sync_video_to_playhead(resume: bool = False) -> None:
+        async def _do() -> None:
+            await _sync_video_to_playhead(resume=resume)
+
+        page.run_task(_do)
+
+    def stop_playback() -> None:
+        nonlocal preview_video
+        state.is_playing = False
+        if preview_video:
+            pv = preview_video
+
+            async def _pause_video() -> None:
+                try:
+                    await pv.pause()
+                except Exception:
+                    pass
+
+            page.run_task(_pause_video)
+
+    async def _playhead_loop() -> None:
+        nonlocal preview_video
+        last_tick = time.perf_counter()
+        stale_ticks = 0
+        while state.is_playing and preview_video:
+            clip = _selected_clip()
+            if not clip:
+                stop_playback()
+                break
+            clip_start = v_start_sec_map.get(clip.id, 0.0)
+            prev_rel_sec = max(0.0, min(clip.dur, state.playhead_sec - clip_start))
+            now = time.perf_counter()
+            dt = max(0.0, now - last_tick)
+            last_tick = now
+
+            try:
+                pos_raw = await preview_video.get_current_position()
+            except Exception:
+                pos_raw = None
+
+            pos_sec: Optional[float] = None
+            if pos_raw is not None:
+                try:
+                    if hasattr(pos_raw, "in_milliseconds"):
+                        pos_sec = max(0.0, float(pos_raw.in_milliseconds) / 1000.0)
+                    elif isinstance(pos_raw, (int, float)):
+                        pos_sec = max(0.0, float(pos_raw) / 1000.0)
+                    elif isinstance(pos_raw, str):
+                        pos_sec = _parse_time_input(pos_raw)
+                except Exception:
+                    pos_sec = None
+
+            wall_rel_sec = prev_rel_sec + dt
+            if pos_sec is None:
+                # Web backend can occasionally return no position; keep playhead moving by wall-clock.
+                rel_sec = wall_rel_sec
+                stale_ticks = 0
+            else:
+                # Backends may report clip-relative time or absolute source time.
+                rel_from_relative = max(0.0, min(clip.dur, pos_sec))
+                rel_from_absolute = max(0.0, min(clip.dur, pos_sec - clip.in_sec))
+                expected_rel = max(0.0, min(clip.dur, wall_rel_sec))
+
+                # Pick the interpretation closest to the expected forward progression.
+                if abs(rel_from_absolute - expected_rel) + 1e-6 < abs(rel_from_relative - expected_rel):
+                    rel_backend = rel_from_absolute
+                else:
+                    rel_backend = rel_from_relative
+
+                # If backend time is stale/regressing, blend toward wall-clock progression.
+                if rel_backend <= prev_rel_sec + 0.001:
+                    stale_ticks += 1
+                else:
+                    stale_ticks = 0
+
+                if stale_ticks >= 2:
+                    rel_sec = max(rel_backend, wall_rel_sec)
+                else:
+                    rel_sec = rel_backend
+
+            rel_sec = max(0.0, min(clip.dur, rel_sec))
+            state.playhead_clip_id = clip.id
+            state.playhead_sec = clip_start + rel_sec
+            update_playhead_ui()
+
+            if state.split_pos_clip_id == clip.id:
+                state.split_pos_sec = rel_sec
+                split_slider.value = rel_sec
+                split_label.value = f"Split: {_fmt_time(rel_sec)}"
+                # Avoid frequent per-control updates while playing in web mode.
+                # The control tree is rebuilt often and async method results can race
+                # with disposal, causing "Control ... is not registered" errors.
+
+            if rel_sec >= clip.dur - 0.02:
+                stop_playback()
+                break
+            await asyncio.sleep(0.08)
+
+    def _timeline_x_to_v1_position(x_px: float) -> tuple[Optional[str], float, float]:
+        """
+        Convert timeline X (same coordinate space as playhead_line center) to:
+        (clip_id, global_sec_on_v1, sec_from_clip_start).
+        """
+        if not state.project.v_clips:
+            return None, 0.0, 0.0
+
+        x = float(x_px)
+        first = state.project.v_clips[0]
+        first_start_px = v_start_px_map.get(first.id, 0.0)
+        if x <= first_start_px:
+            return first.id, v_start_sec_map.get(first.id, 0.0), 0.0
+
+        for c in state.project.v_clips:
+            start_px = v_start_px_map.get(c.id, 0.0)
+            width_px = max(1.0, float(v_clip_width_px_map.get(c.id, max(1.0, c.dur * state.px_per_sec))))
+            end_px = start_px + width_px
+            start_sec = v_start_sec_map.get(c.id, 0.0)
+            if x <= end_px:
+                ratio = max(0.0, min(1.0, (x - start_px) / width_px))
+                rel_sec = c.dur * ratio
+                return c.id, start_sec + rel_sec, rel_sec
+
+        last = state.project.v_clips[-1]
+        last_start_sec = v_start_sec_map.get(last.id, 0.0)
+        return last.id, last_start_sec + last.dur, last.dur
+
+    def _set_playhead_from_timeline_x(x_px: float, from_drag: bool = False) -> bool:
+        clip_id, global_sec, rel_sec = _timeline_x_to_v1_position(x_px)
+        if not clip_id:
+            return False
+
+        if state.is_playing:
+            stop_playback()
+
+        state.playhead_clip_id = clip_id
+        state.playhead_sec = global_sec
+        state.split_pos_clip_id = clip_id
+        state.split_pos_sec = rel_sec
+
+        selection_changed = state.selected_track != "v" or state.selected_clip_id != clip_id
+        state.selected_track = "v"
+        state.selected_clip_id = clip_id
+
+        if selection_changed:
+            update_inspector()
+            return True
+
+        split_slider.value = rel_sec
+        split_label.value = f"Split: {_fmt_time(rel_sec)}"
+        try:
+            split_slider.update()
+            split_label.update()
+        except Exception:
+            pass
+
+        update_playhead_ui()
+        if not from_drag:
+            _run_sync_video_to_playhead(resume=False)
+        return False
+
+    def update_playhead_ui() -> None:
+        if not v_start_sec_map:
+            playhead_line.visible = False
+            return
+        playhead_line.visible = True
+        sec = max(0.0, state.playhead_sec)
+        px = None
+        for c in state.project.v_clips:
+            start_sec = v_start_sec_map.get(c.id, 0.0)
+            end_sec = start_sec + c.dur
+            start_px = v_start_px_map.get(c.id, 0.0)
+            width_px = max(1.0, float(v_clip_width_px_map.get(c.id, max(1.0, c.dur * state.px_per_sec))))
+            if sec >= start_sec and sec <= end_sec:
+                rel = 0.0 if c.dur <= 0 else (sec - start_sec) / c.dur
+                px = start_px + max(0.0, min(1.0, rel)) * width_px
+                break
+        if px is None:
+            if state.project.v_clips:
+                first = state.project.v_clips[0]
+                last = state.project.v_clips[-1]
+                first_px = v_start_px_map.get(first.id, 0.0)
+                last_px = v_start_px_map.get(last.id, 0.0) + max(
+                    0.0,
+                    float(v_clip_width_px_map.get(last.id, last.dur * state.px_per_sec)),
+                )
+                if sec <= 0:
+                    px = first_px
+                else:
+                    px = last_px
+            else:
+                px = 0.0
+        playhead_line.left = max(0.0, timeline_v1_left_offset + px - (playhead_handle_w / 2))
+        try:
+            playhead_line.update()
+        except Exception:
+            pass
+        try:
+            v_row.update()
+        except Exception:
+            pass
+        try:
+            page.update()
+        except Exception:
+            pass
+
+    def _playhead_timeline_x() -> float:
+        return max(0.0, float(playhead_line.left or 0.0) + (playhead_handle_w / 2) - timeline_v1_left_offset)
+
+    def on_playhead_pan_start(_e: ft.DragStartEvent) -> None:
+        nonlocal playhead_drag_start_left, playhead_drag_start_pointer_x
+        playhead_drag_start_left = float(playhead_line.left or 0.0)
+        try:
+            playhead_drag_start_pointer_x = float(_e.global_position.x)
+        except Exception:
+            playhead_drag_start_pointer_x = 0.0
+        if state.is_playing:
+            stop_playback()
+
+    def on_playhead_pan_update(e: ft.DragUpdateEvent) -> None:
+        nonlocal playhead_drag_start_pointer_x
+        dx = None
+        try:
+            dx = float(e.global_position.x) - float(playhead_drag_start_pointer_x)
+        except Exception:
+            dx = None
+        if dx is None:
+            try:
+                if e.local_delta:
+                    dx = float(e.local_delta.x or 0.0)
+            except Exception:
+                dx = None
+        if dx is None:
+            try:
+                dx = float(e.primary_delta or 0.0)
+            except Exception:
+                dx = 0.0
+        target_left = max(0.0, playhead_drag_start_left + dx)
+        timeline_x = target_left + (playhead_handle_w / 2) - timeline_v1_left_offset
+        selection_changed = _set_playhead_from_timeline_x(timeline_x, from_drag=True)
+        if not selection_changed:
+            _run_sync_video_to_playhead(resume=False)
+
+    def on_playhead_tap_down(_e: ft.TapEvent) -> None:
+        _set_playhead_from_timeline_x(_playhead_timeline_x(), from_drag=False)
+
+    def _event_local_xy(e) -> tuple[float, float]:
+        try:
+            return float(e.local_position.x), float(e.local_position.y)
+        except Exception:
+            pass
+        try:
+            return float(getattr(e, "local_x", 0.0) or 0.0), float(getattr(e, "local_y", 0.0) or 0.0)
+        except Exception:
+            return 0.0, 0.0
+
+    def _event_global_x(e) -> Optional[float]:
+        try:
+            return float(e.global_position.x)
+        except Exception:
+            pass
+        try:
+            return float(getattr(e, "global_x", None))
+        except Exception:
+            return None
+        return None
+
+    def on_timeline_tap_down(e: ft.TapEvent) -> None:
+        x, y = _event_local_xy(e)
+        # Ignore top info/zoom row taps.
+        if y < 36:
+            return
+        _set_playhead_from_timeline_x(x - timeline_v1_left_offset, from_drag=False)
+
+    def on_timeline_pan_down(e: ft.DragDownEvent) -> None:
+        x, y = _event_local_xy(e)
+        if y < 36:
+            return
+        _set_playhead_from_timeline_x(x - timeline_v1_left_offset, from_drag=False)
+
+    def on_timeline_pan_start(e: ft.DragStartEvent) -> None:
+        nonlocal timeline_pan_active, timeline_pan_start_pointer_x, timeline_pan_start_playhead_x
+        _x, y = _event_local_xy(e)
+        timeline_pan_active = y >= 36
+        gx = _event_global_x(e)
+        timeline_pan_start_pointer_x = float(gx) if gx is not None else 0.0
+        timeline_pan_start_playhead_x = _playhead_timeline_x()
+        if timeline_pan_active and state.is_playing:
+            stop_playback()
+
+    def on_timeline_pan_update(e: ft.DragUpdateEvent) -> None:
+        nonlocal timeline_pan_active, timeline_pan_start_pointer_x, timeline_pan_start_playhead_x
+        if not timeline_pan_active:
+            return
+
+        dx = None
+        gx = _event_global_x(e)
+        if gx is not None:
+            dx = float(gx) - float(timeline_pan_start_pointer_x)
+        if dx is None:
+            try:
+                if e.local_delta:
+                    dx = float(e.local_delta.x or 0.0)
+            except Exception:
+                dx = None
+        if dx is None:
+            try:
+                dx = float(e.primary_delta or 0.0)
+            except Exception:
+                dx = 0.0
+
+        target_x = max(0.0, timeline_pan_start_playhead_x + dx)
+        selection_changed = _set_playhead_from_timeline_x(target_x, from_drag=True)
+        if not selection_changed:
+            _run_sync_video_to_playhead(resume=False)
+
+    def on_timeline_pan_end(_e: ft.DragEndEvent) -> None:
+        nonlocal timeline_pan_active
+        timeline_pan_active = False
+
+    def on_timeline_right_pan_start(e: ft.PointerEvent) -> None:
+        nonlocal timeline_pan_active, timeline_pan_start_pointer_x, timeline_pan_start_playhead_x
+        x, y = _event_local_xy(e)
+        timeline_pan_active = y >= 36
+        timeline_pan_start_pointer_x = x
+        timeline_pan_start_playhead_x = _playhead_timeline_x()
+        if timeline_pan_active and state.is_playing:
+            stop_playback()
+
+    def on_timeline_right_pan_update(e: ft.PointerEvent) -> None:
+        nonlocal timeline_pan_active, timeline_pan_start_pointer_x, timeline_pan_start_playhead_x
+        if not timeline_pan_active:
+            return
+        x, _y = _event_local_xy(e)
+        dx = x - timeline_pan_start_pointer_x
+        target_x = max(0.0, timeline_pan_start_playhead_x + dx)
+        selection_changed = _set_playhead_from_timeline_x(target_x, from_drag=True)
+        if not selection_changed:
+            _run_sync_video_to_playhead(resume=False)
+
+    def on_timeline_right_pan_end(_e: ft.PointerEvent) -> None:
+        nonlocal timeline_pan_active
+        timeline_pan_active = False
+
+    playhead_handle.on_pan_start = on_playhead_pan_start
+    playhead_handle.on_pan_update = on_playhead_pan_update
+    playhead_handle.on_horizontal_drag_start = on_playhead_pan_start
+    playhead_handle.on_horizontal_drag_update = on_playhead_pan_update
+    playhead_handle.on_tap_down = on_playhead_tap_down
+
     def update_inspector() -> None:
+        def _prepare_web_preview_src(src: str) -> Optional[str]:
+            if not is_web:
+                return src
+            try:
+                src_path = Path(src)
+                if not src_path.exists():
+                    return None
+
+                st = src_path.stat()
+                key = f"{src_path.resolve()}|{st.st_mtime_ns}|{st.st_size}"
+                cached = web_preview_cache.get(key)
+                if cached:
+                    return cached
+
+                ext = (src_path.suffix or ".mp4").lower()
+                digest = hashlib.sha1(key.encode("utf-8", errors="ignore")).hexdigest()[:16]
+                rel = Path("_preview_cache") / f"{digest}{ext}"
+                dst = root / "assets" / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+
+                if not dst.exists() or dst.stat().st_size != st.st_size:
+                    shutil.copy2(src_path, dst)
+
+                rel_web = str(rel).replace("\\", "/")
+                web_preview_cache[key] = rel_web
+                return rel_web
+            except Exception as ex:
+                log.exception("prepare web preview failed: %s", ex)
+                return None
+
         clip = _selected_clip()
         if not clip:
             state.selected_track = None
@@ -798,6 +1268,8 @@ def main(page: ft.Page) -> None:
             split_slider.value = 0.5
             state.split_pos_clip_id = None
             state.split_pos_sec = 0.0
+            state.playhead_clip_id = None
+            state.playhead_sec = 0.0
             trim_in.value = ""
             trim_out.value = ""
             trim_row.visible = False
@@ -806,6 +1278,10 @@ def main(page: ft.Page) -> None:
             audio_pos.visible = False
             _stop_audio_to_clip_start()
             preview_host.content = ft.Text("Preview (optional)", color=ft.Colors.WHITE70)
+            nonlocal preview_video
+            preview_video = None
+            stop_playback()
+            update_playhead_ui()
             page.update()
             return
 
@@ -833,22 +1309,33 @@ def main(page: ft.Page) -> None:
         state.split_pos_sec = max(0.0, min(clip.dur, float(state.split_pos_sec)))
         split_slider.value = state.split_pos_sec
         split_label.value = f"Split: {_fmt_time(state.split_pos_sec)}"
+        state.playhead_clip_id = clip.id
+        clip_start_sec = v_start_sec_map.get(clip.id, 0.0)
+        clip_end_sec = clip_start_sec + clip.dur
+        if state.playhead_sec < clip_start_sec or state.playhead_sec > clip_end_sec:
+            if state.split_pos_clip_id == clip.id:
+                state.playhead_sec = clip_start_sec + state.split_pos_sec
+            else:
+                state.playhead_sec = clip_start_sec
 
         if state.selected_track == "v":
             audio_controls.visible = False
             audio_pos.visible = False
             _stop_audio_to_clip_start()
-            if is_web:
-                # Browser can't reliably play local file paths; keep web UI lightweight.
-                preview_host.content = ft.Text("Preview disabled in browser mode", color=ft.Colors.WHITE70)
-            else:
-                preview_host.content = ftv.Video(
+            preview_src = _prepare_web_preview_src(clip.src)
+            if preview_src:
+                pv = ftv.Video(
                     expand=True,
-                    playlist=[ftv.VideoMedia(clip.src)],
+                    playlist=[ftv.VideoMedia(preview_src)],
                     autoplay=False,
                     muted=True,
                     show_controls=True,
                 )
+                preview_host.content = pv
+                preview_video = pv
+            else:
+                preview_host.content = ft.Text("Preview load failed", color=ft.Colors.WHITE70)
+                preview_video = None
         else:
             audio_controls.visible = audio_preview_enabled
             audio_pos.visible = audio_preview_enabled
@@ -864,6 +1351,9 @@ def main(page: ft.Page) -> None:
                     "ปิดพรีวิวเสียงอยู่ (ตั้งค่า MINICUT_AUDIO_PREVIEW=1 เพื่อเปิดใช้งาน)",
                     color=ft.Colors.WHITE70,
                 )
+            preview_video = None
+        update_playhead_ui()
+        _run_sync_video_to_playhead(resume=False)
         page.update()
 
     def on_split_slider(e: ft.ControlEvent) -> None:
@@ -875,6 +1365,14 @@ def main(page: ft.Page) -> None:
         state.split_pos_clip_id = state.selected_clip_id
         split_label.value = f"Split: {_fmt_time(val)}"
         split_label.update()
+        # Move playhead to match split slider position.
+        clip = _selected_clip()
+        if clip and state.selected_clip_id:
+            start = v_start_sec_map.get(state.selected_clip_id, clip.in_sec)
+            state.playhead_clip_id = state.selected_clip_id
+            state.playhead_sec = start + val
+            update_playhead_ui()
+            _run_sync_video_to_playhead(resume=False)
         refresh_timeline()
 
     split_slider.on_change = on_split_slider
@@ -905,42 +1403,17 @@ def main(page: ft.Page) -> None:
         def _select_at(position_px: float | None = None) -> None:
             state.selected_track = track
             state.selected_clip_id = clip.id
+            state.playhead_clip_id = clip.id
             # If user clicked within the clip, set split position to that proportion.
             if position_px is not None and dur_px > 0 and clip.dur > 0:
                 ratio = max(0.0, min(1.0, position_px / dur_px))
                 state.split_pos_clip_id = clip.id
                 state.split_pos_sec = max(0.0, min(clip.dur, clip.dur * ratio))
+                state.playhead_sec = v_start_sec_map.get(clip.id, 0.0) + state.split_pos_sec
+                update_playhead_ui()
+                _run_sync_video_to_playhead(resume=False)
             update_inspector()
             refresh_timeline()
-
-        dragging = {"active": False}
-
-        def on_tap_down(e: ft.TapEvent):
-            try:
-                px = float(getattr(e, "local_x", None) or 0.0)
-            except Exception:
-                px = None
-            _select_at(px)
-
-        def on_pan_start(e: ft.DragStartEvent):
-            dragging["active"] = True
-            try:
-                px = float(getattr(e, "local_x", None) or 0.0)
-            except Exception:
-                px = None
-            _select_at(px)
-
-        def on_pan_update(e: ft.DragUpdateEvent):
-            if not dragging["active"]:
-                return
-            try:
-                px = float(getattr(e, "local_x", None) or 0.0)
-            except Exception:
-                px = None
-            _select_at(px)
-
-        def on_pan_end(_e: ft.DragEndEvent):
-            dragging["active"] = False
 
         block_height = 28 if is_audio else 36
         cont = ft.Container(
@@ -952,16 +1425,7 @@ def main(page: ft.Page) -> None:
             content=ft.Text(label, size=12, no_wrap=True),
         )
 
-        content_with_gesture = ft.GestureDetector(
-            on_tap=lambda _e: _select_at(),
-            on_tap_down=on_tap_down,
-            on_pan_start=on_pan_start,
-            on_pan_update=on_pan_update,
-            on_pan_end=on_pan_end,
-            content=cont,
-        )
-
-        stack_children = [content_with_gesture]
+        stack_children = [cont]
         if selected and clip.dur > 0:
             try:
                 play_px = max(0.0, min(dur_px, (float(split_slider.value) / clip.dur) * dur_px))
@@ -974,26 +1438,33 @@ def main(page: ft.Page) -> None:
                         top=0,
                         bottom=0,
                         width=2,
-                        bgcolor=ft.Colors.RED_400,
-                        opacity=0.9,
+                        bgcolor=ft.Colors.AMBER_200,
+                        opacity=0.85,
                     )
                 )
 
-        return ft.Draggable(
+        clip_surface = ft.Stack(
+            controls=stack_children,
+            width=dur_px,
+            height=block_height,
+        )
+
+        draggable = ft.Draggable(
             group="tl",
             data={"kind": "clip", "track": track, "id": clip.id},
             axis=ft.Axis.HORIZONTAL,
-            content=ft.Stack(
-                controls=stack_children,
-                width=dur_px,
-                height=block_height,
-            ),
+            on_drag_start=lambda _e: _select_at(),
+            content=clip_surface,
             content_feedback=ft.Container(width=80, height=22, bgcolor=ft.Colors.WHITE24, border_radius=8),
         )
+        return draggable
 
     def refresh_timeline() -> None:
         v_row.controls.clear()
         a_row.controls.clear()
+        v_start_sec_map.clear()
+        v_start_px_map.clear()
+        v_clip_width_px_map.clear()
 
         def handle_drop(track: str, target_clip_id: Optional[str], payload: dict) -> None:
             kind = payload.get("kind")
@@ -1065,7 +1536,7 @@ def main(page: ft.Page) -> None:
                 group="tl",
                 on_accept=on_drop_end,
                 content=ft.Container(
-                    width=160,
+                    width=190,
                     height=height,
                     alignment=ft.Alignment(0, 0),
                     border_radius=10,
@@ -1076,6 +1547,8 @@ def main(page: ft.Page) -> None:
             )
 
         # V1 clips
+        v_time = 0.0
+        v_px = 0.0
         for c in state.project.v_clips:
             def _make_on_accept_v(target_id: str):
                 def _on_accept(e: ft.DragTargetEvent) -> None:
@@ -1089,9 +1562,19 @@ def main(page: ft.Page) -> None:
             drop_zone = ft.DragTarget(
                 group="tl",
                 on_accept=_make_on_accept_v(c.id),
-                content=ft.Container(width=8, height=40, bgcolor=ft.Colors.TRANSPARENT),
+                content=ft.Container(
+                    width=16,
+                    height=40,
+                    bgcolor=ft.Colors.TRANSPARENT,
+                    border=ft.Border(left=ft.BorderSide(1, ft.Colors.WHITE12)),
+                ),
             )
             v_row.controls.append(ft.Row(spacing=0, controls=[drop_zone, ft.Container(width=width, content=block)]))
+            v_start_sec_map[c.id] = v_time
+            v_start_px_map[c.id] = v_px + 16  # clip starts after drop zone
+            v_clip_width_px_map[c.id] = width
+            v_time += c.dur
+            v_px += 16 + width
 
         # A1 clips
         for c in state.project.a_clips:
@@ -1107,7 +1590,12 @@ def main(page: ft.Page) -> None:
             drop_zone = ft.DragTarget(
                 group="tl",
                 on_accept=_make_on_accept_a(c.id),
-                content=ft.Container(width=8, height=34, bgcolor=ft.Colors.TRANSPARENT),
+                content=ft.Container(
+                    width=16,
+                    height=34,
+                    bgcolor=ft.Colors.TRANSPARENT,
+                    border=ft.Border(left=ft.BorderSide(1, ft.Colors.WHITE12)),
+                ),
             )
             a_row.controls.append(ft.Row(spacing=0, controls=[drop_zone, ft.Container(width=width, content=block)]))
 
@@ -1117,6 +1605,9 @@ def main(page: ft.Page) -> None:
         v_total = _fmt_time(total_duration(state.project.v_clips))
         a_total = _fmt_time(total_duration(state.project.a_clips))
         timeline_info.value = f"V1: {len(state.project.v_clips)} clips | {v_total}   A1: {len(state.project.a_clips)} clips | {a_total}"
+        nonlocal timeline_total_sec
+        timeline_total_sec = total_duration(state.project.v_clips)
+        update_playhead_ui()
         page.update()
 
     # ---------- Actions ----------
@@ -1192,17 +1683,38 @@ def main(page: ft.Page) -> None:
             return
         before = _track_clips(state.selected_track)
         selected = _find_clip(state.selected_track, state.selected_clip_id)
+        split_at = float(split_slider.value)
+        split_global_sec = None
+        if selected and state.selected_track == "v":
+            split_global_sec = v_start_sec_map.get(selected.id, 0.0) + split_at
         clips, new_selected, msg = split_clip(
             before,
             state.selected_clip_id,
-            float(split_slider.value),
+            split_at,
         )
         if clips != before:
             _history_record(f"Split {selected.name if selected else 'clip'}")
-        state.selected_clip_id = new_selected
+
+        chosen_id = new_selected
+        if clips != before and new_selected:
+            try:
+                left_idx = next(i for i, c in enumerate(clips) if c.id == new_selected)
+            except StopIteration:
+                left_idx = -1
+            if 0 <= left_idx < len(clips) - 1:
+                right = clips[left_idx + 1]
+                if selected and right.src == selected.src:
+                    chosen_id = right.id
+                    state.split_pos_clip_id = chosen_id
+                    state.split_pos_sec = 0.0
+
+        state.selected_clip_id = chosen_id
         _set_track_clips(state.selected_track, clips)
         if clips != before:
             _mark_dirty()
+            if split_global_sec is not None:
+                state.playhead_sec = split_global_sec
+                state.playhead_clip_id = state.selected_clip_id
         snack(msg)
         update_inspector()
         refresh_timeline()
@@ -1402,6 +1914,15 @@ def main(page: ft.Page) -> None:
                 ft.Text("Inspector", weight=ft.FontWeight.BOLD),
                 selected_title,
                 selected_range,
+                ft.Row(
+                    [
+                        ft.ElevatedButton("Play", icon=ft.Icons.PLAY_ARROW, on_click=play_click),
+                        ft.OutlinedButton("Pause", icon=ft.Icons.PAUSE, on_click=pause_click),
+                        ft.OutlinedButton("Stop", icon=ft.Icons.STOP, on_click=stop_click),
+                    ],
+                    spacing=6,
+                    wrap=True,
+                ),
                 ft.Divider(height=8),
                 split_label,
                 split_slider,
@@ -1416,18 +1937,16 @@ def main(page: ft.Page) -> None:
         ),
     )
 
-    right_panel_items: List[ft.Control] = []
-    if not is_web:
-        right_panel_items.extend(
-            [
-                ft.Text("Preview", weight=ft.FontWeight.BOLD),
-                preview_host,
-                ft.Divider(height=8),
-            ]
-        )
-    right_panel_items.append(inspector)
-
-    right_panel = ft.Column(right_panel_items, expand=True, spacing=8)
+    right_panel = ft.Column(
+        [
+            ft.Text("Preview", weight=ft.FontWeight.BOLD),
+            preview_host,
+            ft.Divider(height=8),
+            inspector,
+        ],
+        expand=True,
+        spacing=8,
+    )
 
     # On web, we observed cases where the main row content could overflow and visually cover the
     # fixed-height timeline panel. Clip the main area so the timeline is always visible.
@@ -1440,20 +1959,54 @@ def main(page: ft.Page) -> None:
         content=ft.Row([left_panel, ft.VerticalDivider(width=8), right_panel], expand=True),
     )
 
+    timeline_content = ft.Column(
+        [
+            ft.Row([timeline_info, ft.Container(expand=True), ft.Text("Zoom"), timeline_zoom]),
+            ft.Divider(height=6),
+            ft.Row(
+                [
+                    ft.Text("V1", width=timeline_lane_label_w),
+                    ft.Container(width=timeline_lane_gap_w),
+                    v_row,
+                ],
+                expand=True,
+                spacing=0,
+            ),
+            ft.Row(
+                [
+                    ft.Text("A1", width=timeline_lane_label_w),
+                    ft.Container(width=timeline_lane_gap_w),
+                    a_row,
+                ],
+                expand=True,
+                spacing=0,
+            ),
+        ],
+        expand=True,
+    )
+
+    timeline_surface = ft.GestureDetector(
+        mouse_cursor=ft.MouseCursor.MOVE,
+        on_tap_down=on_timeline_tap_down,
+        on_pan_down=on_timeline_pan_down,
+        on_pan_start=on_timeline_pan_start,
+        on_pan_update=on_timeline_pan_update,
+        on_pan_end=on_timeline_pan_end,
+        on_horizontal_drag_start=on_timeline_pan_start,
+        on_horizontal_drag_update=on_timeline_pan_update,
+        on_horizontal_drag_end=on_timeline_pan_end,
+        on_right_pan_start=on_timeline_right_pan_start,
+        on_right_pan_update=on_timeline_right_pan_update,
+        on_right_pan_end=on_timeline_right_pan_end,
+        content=ft.Stack([timeline_content, playhead_line]),
+    )
+
     timeline = ft.Container(
         padding=10,
         height=180,
         border_radius=12,
         bgcolor=ft.Colors.BLUE_GREY_900,
-        content=ft.Column(
-            [
-                ft.Row([timeline_info, ft.Container(expand=True), ft.Text("Zoom"), timeline_zoom]),
-                ft.Divider(height=6),
-                ft.Row([ft.Text("V1", width=30), v_row], expand=True),
-                ft.Row([ft.Text("A1", width=30), a_row], expand=True),
-            ],
-            expand=True,
-        ),
+        content=timeline_surface,
     )
 
     page.add(ft.Column([toolbar, main_row, timeline], expand=True, spacing=10))
@@ -1480,6 +2033,7 @@ def main(page: ft.Page) -> None:
                 state.selected_clip_id = state.project.v_clips[0].id
                 update_inspector()
                 refresh_timeline()
+
 
     def _choose_demo_files(demo_dir: Path) -> List[Path]:
         files = sorted([p for p in demo_dir.glob("*.mp4") if p.is_file()])
@@ -1625,6 +2179,14 @@ def main(page: ft.Page) -> None:
             update_inspector()
             await asyncio.sleep(0.6)
             await _shot("03_on_timeline")
+
+            # Playback smoke test: play briefly and ensure playhead can advance.
+            play_click(None)
+            await asyncio.sleep(1.1)
+            await _shot("03_playing")
+            pause_click(None)
+            await asyncio.sleep(0.3)
+            await _shot("03_paused")
 
             # Split each clip in half and keep the first half.
             for i, src in enumerate(demo_files, start=1):
