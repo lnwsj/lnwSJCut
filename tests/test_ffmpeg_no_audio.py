@@ -6,6 +6,21 @@ from core.model import Clip, ExportSettings, Track, Transition
 
 
 class TestFFmpegNoAudio(unittest.TestCase):
+    def test_build_export_command_applies_speed_filters(self):
+        clip = Clip(
+            id="v1",
+            src="hasaudio.mp4",
+            in_sec=1.0,
+            out_sec=5.0,
+            speed=2.0,
+            muted=False,
+            has_audio=True,
+        )
+        cmd = build_export_command("ffmpeg", [clip], "out.mp4")
+        joined = " ".join(cmd)
+        self.assertIn("setpts=(PTS-STARTPTS)/2.000000", joined)
+        self.assertIn("atempo=2.000000", joined)
+
     def test_build_export_command_uses_silence_when_clip_has_no_audio(self):
         clip = Clip(
             id="v1",

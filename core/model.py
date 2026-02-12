@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import uuid
@@ -9,6 +10,20 @@ import uuid
 def new_id() -> str:
     """Generate a stable unique id for UI/timeline operations."""
     return uuid.uuid4().hex
+
+
+MIN_CLIP_SPEED = 0.25
+MAX_CLIP_SPEED = 4.0
+
+
+def normalize_speed(value: Any, default: float = 1.0) -> float:
+    try:
+        out = float(value)
+    except Exception:
+        out = float(default)
+    if not math.isfinite(out):
+        out = float(default)
+    return max(MIN_CLIP_SPEED, min(MAX_CLIP_SPEED, out))
 
 
 @dataclass
@@ -96,6 +111,7 @@ class Clip:
     src: str
     in_sec: float
     out_sec: float
+    speed: float = 1.0
     volume: float = 1.0
     muted: bool = False
     has_audio: bool = True
@@ -103,7 +119,8 @@ class Clip:
 
     @property
     def dur(self) -> float:
-        return max(0.0, self.out_sec - self.in_sec)
+        src_dur = max(0.0, self.out_sec - self.in_sec)
+        return src_dur / normalize_speed(self.speed)
 
     @property
     def name(self) -> str:
@@ -128,6 +145,7 @@ class Clip:
             src=str(d["src"]),
             in_sec=float(d["in_sec"]),
             out_sec=float(d["out_sec"]),
+            speed=normalize_speed(d.get("speed", 1.0), default=1.0),
             volume=float(d.get("volume", 1.0) or 1.0),
             muted=bool(d.get("muted", False)),
             has_audio=bool(d.get("has_audio", True)),

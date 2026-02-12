@@ -23,6 +23,18 @@ class TestTimeline(unittest.TestCase):
         self.assertIsNotNone(sel)
         self.assertEqual(msg, "Split แล้ว")
 
+    def test_split_clip_respects_speed(self):
+        c = Clip(id=new_id(), src="a.mp4", in_sec=10.0, out_sec=14.0, speed=2.0)
+        clips, _sel, msg = split_clip([c], c.id, 1.0)
+        self.assertIn("Split", msg)
+        self.assertEqual(len(clips), 2)
+        self.assertAlmostEqual(clips[0].in_sec, 10.0)
+        self.assertAlmostEqual(clips[0].out_sec, 12.0)
+        self.assertAlmostEqual(clips[1].in_sec, 12.0)
+        self.assertAlmostEqual(clips[1].out_sec, 14.0)
+        self.assertAlmostEqual(clips[0].dur, 1.0)
+        self.assertAlmostEqual(clips[1].dur, 1.0)
+
     def test_split_clip_at_timeline_sec_middle(self):
         a = Clip(id="a", src="a.mp4", in_sec=0.0, out_sec=3.0)
         b = Clip(id="b", src="b.mp4", in_sec=0.0, out_sec=2.0)

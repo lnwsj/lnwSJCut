@@ -18,7 +18,7 @@ import flet_video as ftv
 from core.config import ConfigStore
 from core.ffmpeg import FFmpegNotFound, export_project, export_project_with_progress, probe_media, resolve_ffmpeg_bins
 from core.history import HistoryEntry, HistoryManager
-from core.model import ExportSettings, Project, Transition
+from core.model import MAX_CLIP_SPEED, MIN_CLIP_SPEED, ExportSettings, Project, Transition, normalize_speed
 from core.project_io import load_project, save_project
 from core.thumbnails import generate_thumbnail, generate_waveform
 from core.timeline import (
@@ -274,6 +274,24 @@ def main(page: ft.Page) -> None:
             return None
         return None
 
+    def _clip_speed(clip) -> float:
+        return normalize_speed(getattr(clip, "speed", 1.0), default=1.0)
+
+    def _timeline_rel_to_source_sec(clip, rel_sec: float) -> float:
+        speed = _clip_speed(clip)
+        rel = max(0.0, min(float(clip.dur), float(rel_sec)))
+        return float(clip.in_sec) + (rel * speed)
+
+    def _source_abs_to_timeline_rel(clip, source_sec: float) -> float:
+        speed = _clip_speed(clip)
+        rel = (float(source_sec) - float(clip.in_sec)) / speed
+        return max(0.0, min(float(clip.dur), rel))
+
+    def _source_rel_to_timeline_rel(clip, source_rel_sec: float) -> float:
+        speed = _clip_speed(clip)
+        rel = float(source_rel_sec) / speed
+        return max(0.0, min(float(clip.dur), rel))
+
     _update_title()
 
     def _track_obj(track_id: Optional[str]):
@@ -471,7 +489,7 @@ def main(page: ft.Page) -> None:
                 ffmpeg_path=ffmpeg,
                 src=clip.src,
                 in_sec=clip.in_sec,
-                duration=clip.dur,
+                duration=max(0.0, float(clip.out_sec) - float(clip.in_sec)),
                 cache_dir=timeline_wave_dir,
                 width=420,
                 height=42,
@@ -883,7 +901,7 @@ def main(page: ft.Page) -> None:
         except Exception:
             rel = 0.0
         rel = max(0.0, min(clip.dur, rel))
-        return clip.in_sec + rel
+        return _timeline_rel_to_source_sec(clip, rel)
 
     def _apply_trim_values(new_in: float, new_out: float, action_label: str = "Trim") -> bool:
         if not state.selected_track or not state.selected_clip_id:
@@ -933,7 +951,8 @@ def main(page: ft.Page) -> None:
             _history_record(f"Trim {clip.name}")
             _set_track_clips(state.selected_track, clips)
             _mark_dirty()
-            new_rel = max(0.0, min(new_out - new_in, anchor_source_sec - new_in))
+            speed = _clip_speed(clip)
+            new_rel = max(0.0, min((new_out - new_in) / speed, (anchor_source_sec - new_in) / speed))
             state.split_pos_clip_id = clip.id
             state.split_pos_sec = new_rel
 
@@ -1121,7 +1140,46 @@ def main(page: ft.Page) -> None:
         tight=True,
     )
 
-    # ---------- Clip audio controls (export-time) ----------
+    # ---------- Clip speed + audio controls (export-time) ----------
+    speed_title = ft.Text("Speed", weight=ft.FontWeight.BOLD, size=12)
+    speed_value = ft.Text("1.00x", size=12, color=ft.Colors.WHITE70)
+    speed_divisions = max(1, int(round((float(MAX_CLIP_SPEED) - float(MIN_CLIP_SPEED)) * 100)))
+    speed_slider = ft.Slider(
+        min=float(MIN_CLIP_SPEED),
+        max=float(MAX_CLIP_SPEED),
+        value=1.0,
+        divisions=speed_divisions,
+        round=2,
+    )
+    speed_apply = ft.OutlinedButton("Apply Speed")
+    speed_reset = ft.TextButton("Reset 1.00x")
+    speed_btn_05 = ft.TextButton("0.5x")
+    speed_btn_125 = ft.TextButton("1.25x")
+    speed_btn_15 = ft.TextButton("1.5x")
+    speed_btn_20 = ft.TextButton("2x")
+    speed_panel = ft.Column(
+        [
+            speed_title,
+            ft.Row([ft.Text("Rate", size=12), ft.Container(expand=True), speed_value], tight=True),
+            speed_slider,
+            ft.Row(
+                [
+                    speed_apply,
+                    speed_reset,
+                    speed_btn_05,
+                    speed_btn_125,
+                    speed_btn_15,
+                    speed_btn_20,
+                ],
+                wrap=True,
+                spacing=4,
+            ),
+        ],
+        visible=False,
+        spacing=4,
+        tight=True,
+    )
+
     volume_title = ft.Text("Audio", weight=ft.FontWeight.BOLD, size=12)
     volume_value = ft.Text("1.00x", size=12, color=ft.Colors.WHITE70)
     volume_slider = ft.Slider(min=0.0, max=3.0, value=1.0, divisions=300, round=2)
@@ -1216,7 +1274,7 @@ def main(page: ft.Page) -> None:
             audio.update()
 
         offset = float(split_slider.value) if from_split else 0.0
-        start = clip.in_sec + offset
+        start = _timeline_rel_to_source_sec(clip, offset)
         start = min(max(clip.in_sec, start), max(clip.in_sec, clip.out_sec - 0.01))
         start_ms = int(start * 1000)
 
@@ -1260,7 +1318,7 @@ def main(page: ft.Page) -> None:
         if not clip:
             return
         pos_sec = float(e.position) / 1000.0
-        rel_sec = max(0.0, pos_sec - clip.in_sec)
+        rel_sec = _source_abs_to_timeline_rel(clip, pos_sec)
         audio_pos.value = f"{_fmt_time(rel_sec)} / {_fmt_time(clip.dur)}"
         audio_pos.update()
 
@@ -1301,6 +1359,69 @@ def main(page: ft.Page) -> None:
         update_inspector()
         refresh_timeline()
 
+    def _set_selected_clip_speed(speed: float, label: str = "Speed") -> None:
+        clip = _selected_clip()
+        track = state.selected_track
+        if not clip or not track or _track_obj(track) is None:
+            return
+
+        target_speed = normalize_speed(speed, default=_clip_speed(clip))
+        if abs(_clip_speed(clip) - target_speed) < 1e-6:
+            return
+
+        before = _track_clips(track)
+        out = []
+        changed = False
+        for c in before:
+            if c.id != clip.id:
+                out.append(c)
+                continue
+            nc = replace(c, speed=target_speed)
+            out.append(nc)
+            changed = changed or (nc != c)
+
+        if not changed:
+            return
+        if state.is_playing:
+            stop_playback()
+        _history_record(f"{label} {clip.name}")
+        _set_track_clips(track, out)
+        _mark_dirty()
+        update_inspector()
+        refresh_timeline()
+
+    def on_speed_change(e: ft.ControlEvent) -> None:
+        try:
+            val = normalize_speed(float(e.control.value), default=1.0)
+            speed_value.value = f"{val:.2f}x"
+        except Exception:
+            speed_value.value = "-"
+        speed_value.update()
+
+    def _apply_speed_value(raw_value: object, label: str = "Speed") -> None:
+        clip = _selected_clip()
+        if not clip:
+            return
+        try:
+            val = normalize_speed(float(raw_value), default=_clip_speed(clip))
+        except Exception:
+            return
+        speed_slider.value = val
+        speed_value.value = f"{val:.2f}x"
+        _set_selected_clip_speed(val, label=label)
+
+    def on_speed_change_end(e: ft.ControlEvent) -> None:
+        _apply_speed_value(e.control.value, label="Speed")
+
+    def on_speed_apply_click(_e=None) -> None:
+        _apply_speed_value(speed_slider.value, label="Speed")
+
+    def _make_speed_preset_handler(rate: float):
+        def _handler(_e=None) -> None:
+            _apply_speed_value(rate, label="Speed")
+
+        return _handler
+
     def on_volume_change(e: ft.ControlEvent) -> None:
         try:
             volume_value.value = f"{float(e.control.value):.2f}x"
@@ -1328,6 +1449,15 @@ def main(page: ft.Page) -> None:
         if bool(getattr(clip, "muted", False)) == m:
             return
         _set_selected_clip_audio(muted=m, label="Mute")
+
+    speed_slider.on_change = on_speed_change
+    speed_slider.on_change_end = on_speed_change_end
+    speed_apply.on_click = on_speed_apply_click
+    speed_reset.on_click = _make_speed_preset_handler(1.0)
+    speed_btn_05.on_click = _make_speed_preset_handler(0.5)
+    speed_btn_125.on_click = _make_speed_preset_handler(1.25)
+    speed_btn_15.on_click = _make_speed_preset_handler(1.5)
+    speed_btn_20.on_click = _make_speed_preset_handler(2.0)
 
     volume_slider.on_change = on_volume_change
     volume_slider.on_change_end = on_volume_change_end
@@ -1379,11 +1509,11 @@ def main(page: ft.Page) -> None:
         clip = _selected_clip()
         if not clip:
             return
-        seek_sec = max(0.0, state.playhead_sec)
+        seek_sec = max(0.0, float(clip.in_sec))
         if state.playhead_clip_id == clip.id:
             clip_start = v_start_sec_map.get(clip.id, 0.0)
             rel = max(0.0, min(clip.dur, state.playhead_sec - clip_start))
-            seek_sec = clip.in_sec + rel
+            seek_sec = _timeline_rel_to_source_sec(clip, rel)
         try:
             await preview_video.pause()
         except Exception:
@@ -1392,6 +1522,11 @@ def main(page: ft.Page) -> None:
             return
         try:
             await preview_video.seek(int(seek_sec * 1000))
+        except Exception:
+            pass
+        try:
+            preview_video.playback_rate = _clip_speed(clip)
+            preview_video.update()
         except Exception:
             pass
         if expected_playback_id is not None and expected_playback_id != playback_loop_id:
@@ -1483,15 +1618,13 @@ def main(page: ft.Page) -> None:
 
             rel_backend: Optional[float] = None
             if pos_sec is not None:
-                # Backends may report clip-relative time or absolute source time.
-                rel_from_relative = max(0.0, min(clip.dur, pos_sec))
-                rel_from_absolute = max(0.0, min(clip.dur, pos_sec - clip.in_sec))
-
-                # Pick the interpretation closest to the expected forward progression.
-                if abs(rel_from_absolute - expected_rel) + 1e-6 < abs(rel_from_relative - expected_rel):
-                    rel_backend = rel_from_absolute
-                else:
-                    rel_backend = rel_from_relative
+                # Backends may report timeline-relative, source-relative, or absolute source time.
+                candidates = [
+                    max(0.0, min(clip.dur, pos_sec)),
+                    _source_rel_to_timeline_rel(clip, pos_sec),
+                    _source_abs_to_timeline_rel(clip, pos_sec),
+                ]
+                rel_backend = min(candidates, key=lambda v: abs(v - expected_rel))
 
             # Avoid racing ahead during startup while the media backend is still ramping up.
             if startup_mode:
@@ -1873,6 +2006,9 @@ def main(page: ft.Page) -> None:
             transition_dur_value.value = "0.50s"
             transition_apply.disabled = True
             transition_hint.value = ""
+            speed_panel.visible = False
+            speed_slider.value = 1.0
+            speed_value.value = "1.00x"
             audio_edit_panel.visible = False
             audio_controls.visible = False
             audio_pos.visible = False
@@ -1888,22 +2024,30 @@ def main(page: ft.Page) -> None:
             return
 
         prefix = f"[{_track_name(state.selected_track)}]"
+        clip_speed = _clip_speed(clip)
+        source_span = max(0.0, float(clip.out_sec) - float(clip.in_sec))
         selected_title.value = f"{prefix} {clip.name}"
-        selected_range.value = f"in={_fmt_time(clip.in_sec)}  out={_fmt_time(clip.out_sec)}  dur={_fmt_time(clip.dur)}"
+        selected_range.value = (
+            f"in={_fmt_time(clip.in_sec)}  out={_fmt_time(clip.out_sec)}  "
+            f"src={_fmt_time(source_span)}  dur={_fmt_time(clip.dur)}  speed={clip_speed:.2f}x"
+        )
         trim_in.value = _fmt_time(clip.in_sec)
         trim_out.value = _fmt_time(clip.out_sec)
         src_dur = _selected_source_duration(clip)
         if src_dur is not None:
             trim_hint.value = (
-                f"Source: {_fmt_time(src_dur)} | Clip: {_fmt_time(clip.dur)} "
+                f"Source: {_fmt_time(src_dur)} | Clip: {_fmt_time(clip.dur)} @ {clip_speed:.2f}x "
                 f"| Min trim length: {_fmt_time(trim_min_piece_sec)}"
             )
         else:
             trim_hint.value = (
-                f"Clip: {_fmt_time(clip.dur)} | Min trim length: {_fmt_time(trim_min_piece_sec)} "
+                f"Clip: {_fmt_time(clip.dur)} @ {clip_speed:.2f}x | Min trim length: {_fmt_time(trim_min_piece_sec)} "
                 "(source duration unknown)"
             )
         trim_row.visible = True
+        speed_panel.visible = True
+        speed_slider.value = clip_speed
+        speed_value.value = f"{clip_speed:.2f}x"
         audio_edit_panel.visible = True
 
         if _is_selected_video():
@@ -3372,6 +3516,7 @@ def main(page: ft.Page) -> None:
                 split_label,
                 split_slider,
                 trim_row,
+                speed_panel,
                 transition_panel,
                 audio_edit_panel,
                 audio_controls,

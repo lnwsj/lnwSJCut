@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
-from .model import Clip, ExportSettings, Track, transition_overlap_sec
+from .model import Clip, ExportSettings, Track, normalize_speed, transition_overlap_sec
 from .timeline import total_duration
 
 
@@ -235,6 +235,55 @@ def parse_ffmpeg_progress_seconds(line: str) -> Optional[float]:
         return None
 
 
+def _clip_speed(clip: Clip) -> float:
+    return normalize_speed(getattr(clip, "speed", 1.0), default=1.0)
+
+
+def _video_setpts_for_speed(speed: float) -> str:
+    s = max(0.000001, float(speed))
+    if abs(s - 1.0) < 1e-9:
+        return "setpts=PTS-STARTPTS"
+    return f"setpts=(PTS-STARTPTS)/{s:.6f}"
+
+
+def _atempo_chain_for_speed(speed: float) -> str:
+    s = max(0.000001, float(speed))
+    if abs(s - 1.0) < 1e-9:
+        return ""
+
+    factors: List[float] = []
+    while s > 2.0 + 1e-9:
+        factors.append(2.0)
+        s /= 2.0
+    while s < 0.5 - 1e-9:
+        factors.append(0.5)
+        s /= 0.5
+    factors.append(s)
+    return ",".join(f"atempo={f:.6f}" for f in factors)
+
+
+def _video_segment_filter(input_idx: int, clip: Clip, out_label: str) -> str:
+    speed = _clip_speed(clip)
+    return (
+        f"[{input_idx}:v]trim=start={clip.in_sec}:end={clip.out_sec},"
+        f"{_video_setpts_for_speed(speed)}[{out_label}]"
+    )
+
+
+def _audio_segment_filter(input_idx: int, clip: Clip, out_label: str, vol: float) -> str:
+    speed = _clip_speed(clip)
+    parts = [
+        f"[{input_idx}:a]atrim=start={clip.in_sec}:end={clip.out_sec}",
+        "asetpts=PTS-STARTPTS",
+        "aformat=sample_rates=48000:channel_layouts=stereo",
+    ]
+    atempo = _atempo_chain_for_speed(speed)
+    if atempo:
+        parts.append(atempo)
+    parts.append(f"volume={vol:.2f}[{out_label}]")
+    return ",".join(parts)
+
+
 def _normalize_export_settings(export_settings: Optional[ExportSettings]) -> ExportSettings:
     if export_settings is None:
         raw = ExportSettings()
@@ -447,9 +496,7 @@ def build_export_command(
         a = f"a{i}"
         v_labels.append(v)
         a_labels.append(a)
-        parts.append(
-            f"[{idx}:v]trim=start={c.in_sec}:end={c.out_sec},setpts=PTS-STARTPTS[{v}]"
-        )
+        parts.append(_video_segment_filter(idx, c, v))
         vol = max(0.0, float(getattr(c, "volume", 1.0) or 1.0))
         muted = bool(getattr(c, "muted", False))
         has_audio = bool(getattr(c, "has_audio", True))
@@ -459,10 +506,7 @@ def build_export_command(
                 f"atrim=start=0:end={c.dur},asetpts=PTS-STARTPTS[{a}]"
             )
         else:
-            parts.append(
-                f"[{idx}:a]atrim=start={c.in_sec}:end={c.out_sec},asetpts=PTS-STARTPTS,"
-                f"aformat=sample_rates=48000:channel_layouts=stereo,volume={vol:.2f}[{a}]"
-            )
+            parts.append(_audio_segment_filter(idx, c, a, vol))
     final_v, final_a, _total = _build_transition_chain(parts, clips, v_labels, a_labels)
     _append_final_video_filter(parts, final_v, settings)
     if final_a is None:
@@ -557,7 +601,7 @@ def _build_export_command_tracks(
             a = f"ta{ti}_{i}"
             v_labels.append(v)
             a_labels.append(a)
-            parts.append(f"[{idx}:v]trim=start={c.in_sec}:end={c.out_sec},setpts=PTS-STARTPTS[{v}]")
+            parts.append(_video_segment_filter(idx, c, v))
 
             vol = max(0.0, float(getattr(c, "volume", 1.0) or 1.0))
             muted = bool(getattr(c, "muted", False)) or bool(t.muted) or (not t.visible)
@@ -568,10 +612,7 @@ def _build_export_command_tracks(
                     f"atrim=start=0:end={c.dur},asetpts=PTS-STARTPTS[{a}]"
                 )
             else:
-                parts.append(
-                    f"[{idx}:a]atrim=start={c.in_sec}:end={c.out_sec},asetpts=PTS-STARTPTS,"
-                    f"aformat=sample_rates=48000:channel_layouts=stereo,volume={vol:.2f}[{a}]"
-                )
+                parts.append(_audio_segment_filter(idx, c, a, vol))
 
         out_v, out_a, t_dur = _build_transition_chain(parts, t.clips, v_labels, a_labels)
         video_outputs.append((t, out_v, out_a, t_dur))
@@ -608,10 +649,7 @@ def _build_export_command_tracks(
                     f"atrim=start=0:end={c.dur},asetpts=PTS-STARTPTS[{a}]"
                 )
             else:
-                parts.append(
-                    f"[{idx}:a]atrim=start={c.in_sec}:end={c.out_sec},asetpts=PTS-STARTPTS,"
-                    f"aformat=sample_rates=48000:channel_layouts=stereo,volume={vol:.2f}[{a}]"
-                )
+                parts.append(_audio_segment_filter(idx, c, a, vol))
             segs.append(f"[{a}]")
             t_total += float(c.dur)
 
@@ -732,7 +770,7 @@ def build_export_command_project(
         idx = src_to_idx[c.src]
         v = f"v{i}"
         v_video_labels.append(v)
-        parts.append(f"[{idx}:v]trim=start={c.in_sec}:end={c.out_sec},setpts=PTS-STARTPTS[{v}]")
+        parts.append(_video_segment_filter(idx, c, v))
 
         if need_v1_audio:
             a = f"va{i}"
@@ -741,10 +779,7 @@ def build_export_command_project(
             muted = bool(getattr(c, "muted", False))
             has_audio = bool(getattr(c, "has_audio", True)) and infos[c.src].has_audio
             if has_audio and not muted:
-                parts.append(
-                    f"[{idx}:a]atrim=start={c.in_sec}:end={c.out_sec},asetpts=PTS-STARTPTS,"
-                    f"aformat=sample_rates=48000:channel_layouts=stereo,volume={vol:.2f}[{a}]"
-                )
+                parts.append(_audio_segment_filter(idx, c, a, vol))
             else:
                 # Silence segment matching the clip duration.
                 parts.append(
@@ -779,10 +814,7 @@ def build_export_command_project(
                     f"atrim=start=0:end={c.dur},asetpts=PTS-STARTPTS[{a}]"
                 )
             else:
-                parts.append(
-                    f"[{idx}:a]atrim=start={c.in_sec}:end={c.out_sec},asetpts=PTS-STARTPTS,"
-                    f"aformat=sample_rates=48000:channel_layouts=stereo,volume={vol:.2f}[{a}]"
-                )
+                parts.append(_audio_segment_filter(idx, c, a, vol))
             a_seg_labels.append(f"[{a}]")
         parts.append(f"{''.join(a_seg_labels)}concat=n={len(a_clips)}:v=0:a=1[a_a1]")
 

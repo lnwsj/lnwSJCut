@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import List, Optional, Tuple
 
-from .model import Clip, new_id, transition_overlap_sec
+from .model import Clip, new_id, normalize_speed, transition_overlap_sec
 
 
 def add_clip_end(clips: List[Clip], src: str, duration: float, has_audio: bool = True) -> List[Clip]:
@@ -74,7 +74,8 @@ def split_clip(
             new_selected = c.id
             continue
 
-        mid = c.in_sec + t
+        speed = normalize_speed(getattr(c, "speed", 1.0), default=1.0)
+        mid = c.in_sec + (t * speed)
         c1 = replace(c, id=new_id(), in_sec=c.in_sec, out_sec=mid)
         c2 = replace(c, id=new_id(), in_sec=mid, out_sec=c.out_sec)
         out.extend([c1, c2])

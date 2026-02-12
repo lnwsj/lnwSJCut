@@ -21,8 +21,8 @@ class TestProjectModel(unittest.TestCase):
         self.assertTrue(p.v_clips[0].has_audio)
 
     def test_roundtrip_new_format(self):
-        v = Clip(id="v1", src="a.mp4", in_sec=0.0, out_sec=2.0, volume=0.5, muted=False, has_audio=False)
-        a = Clip(id="a1", src="b.mp3", in_sec=1.0, out_sec=3.0, volume=1.0, muted=True, has_audio=True)
+        v = Clip(id="v1", src="a.mp4", in_sec=0.0, out_sec=2.0, speed=1.5, volume=0.5, muted=False, has_audio=False)
+        a = Clip(id="a1", src="b.mp3", in_sec=1.0, out_sec=3.0, speed=0.5, volume=1.0, muted=True, has_audio=True)
         p = Project(v_clips=[v], a_clips=[a], fps=24)
 
         d = p.to_dict()
@@ -34,12 +34,23 @@ class TestProjectModel(unittest.TestCase):
         self.assertEqual(len(p2.v_clips), 1)
         self.assertEqual(len(p2.a_clips), 1)
         self.assertEqual(p2.a_clips[0].src, "b.mp3")
+        self.assertAlmostEqual(p2.v_clips[0].speed, 1.5)
         self.assertAlmostEqual(p2.v_clips[0].volume, 0.5)
         self.assertFalse(p2.v_clips[0].muted)
         self.assertFalse(p2.v_clips[0].has_audio)
+        self.assertAlmostEqual(p2.a_clips[0].speed, 0.5)
         self.assertAlmostEqual(p2.a_clips[0].volume, 1.0)
         self.assertTrue(p2.a_clips[0].muted)
         self.assertTrue(p2.a_clips[0].has_audio)
+
+    def test_clip_speed_from_dict_defaults_and_clamps(self):
+        c = Clip.from_dict({"id": "x", "src": "a.mp4", "in_sec": 0.0, "out_sec": 4.0, "speed": "bad"})
+        self.assertAlmostEqual(c.speed, 1.0)
+        self.assertAlmostEqual(c.dur, 4.0)
+
+        c2 = Clip.from_dict({"id": "y", "src": "a.mp4", "in_sec": 0.0, "out_sec": 4.0, "speed": 99})
+        self.assertAlmostEqual(c2.speed, 4.0)
+        self.assertAlmostEqual(c2.dur, 1.0)
 
     def test_clip_transition_roundtrip(self):
         v = Clip(
