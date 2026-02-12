@@ -16,10 +16,11 @@ import flet_audio as fta
 import flet_video as ftv
 
 from core.config import ConfigStore
-from core.ffmpeg import FFmpegNotFound, export_project, probe_media, resolve_ffmpeg_bins
+from core.ffmpeg import FFmpegNotFound, export_project, export_project_with_progress, probe_media, resolve_ffmpeg_bins
 from core.history import HistoryEntry, HistoryManager
-from core.model import Project
+from core.model import ExportSettings, Project, Transition
 from core.project_io import load_project, save_project
+from core.thumbnails import generate_thumbnail, generate_waveform
 from core.timeline import (
     add_clip_end,
     duplicate_clip,
@@ -108,15 +109,17 @@ class AppState:
         self.project: Project = Project(v_clips=[], a_clips=[], fps=30)
         self.project_path: Optional[str] = None
         self.dirty: bool = False
-        self.selected_track: Optional[str] = None  # "v" | "a"
+        # Selected timeline track id (e.g. "v1_xxx", "a2_xxx").
+        self.selected_track: Optional[str] = None
         self.selected_clip_id: Optional[str] = None
         self.px_per_sec: float = 60.0  # timeline zoom
         self.export_audio_mode: str = "mix"  # "mix" | "a1_only" | "v1_only"
+        self.export_settings: ExportSettings = ExportSettings()
         # Split marker time (seconds) for the currently selected clip.
         self.split_pos_sec: float = 0.0
         self.split_pos_clip_id: Optional[str] = None
         # Playback / playhead
-        self.playhead_sec: float = 0.0  # global timeline seconds on V1
+        self.playhead_sec: float = 0.0  # global timeline seconds on the active video timeline track
         self.playhead_clip_id: Optional[str] = None
         self.is_playing: bool = False
 
@@ -136,6 +139,12 @@ def main(page: ft.Page) -> None:
     root = Path(__file__).resolve().parent
     state = AppState()
     web_preview_cache: dict[str, str] = {}
+    timeline_visual_web_cache: dict[str, str] = {}
+    timeline_cache_root = root / ".cache" / "timeline_visuals"
+    timeline_thumb_dir = timeline_cache_root / "thumbs"
+    timeline_wave_dir = timeline_cache_root / "waves"
+    timeline_ffmpeg_path: Optional[str] = None
+    timeline_visual_disabled: bool = False
     history = HistoryManager(limit=50)
     cfg = ConfigStore.default()
     playhead_handle_w = 14.0
@@ -158,8 +167,11 @@ def main(page: ft.Page) -> None:
             content=playhead_bar,
         ),
     )
-    playhead_line = ft.Container(left=0, top=28, content=playhead_handle)
+    timeline_header_h = 70.0
+    playhead_line = ft.Container(left=0, top=timeline_header_h, content=playhead_handle)
     preview_video: Optional[ftv.Video] = None
+    preview_video_src: Optional[str] = None
+    playback_loop_id: int = 0
     v_start_sec_map: dict[str, float] = {}
     v_start_px_map: dict[str, float] = {}
     v_clip_width_px_map: dict[str, float] = {}
@@ -168,10 +180,11 @@ def main(page: ft.Page) -> None:
     timeline_pan_active: bool = False
     timeline_pan_start_pointer_x: float = 0.0
     timeline_pan_start_playhead_x: float = 0.0
-    timeline_lane_label_w = 30.0
+    timeline_lane_label_w = 78.0
     timeline_lane_gap_w = 8.0
     timeline_v1_left_offset = timeline_lane_label_w + timeline_lane_gap_w
     timeline_total_sec: float = 0.0
+    export_in_progress: bool = False
 
     # Default project path keeps existing behavior (single project.json in repo root).
     state.project_path = str(root / "project.json")
@@ -187,6 +200,36 @@ def main(page: ft.Page) -> None:
         except FFmpegNotFound as e:
             snack(str(e))
             return None
+
+    def _existing_dir_or_none(path_like: Optional[str]) -> Optional[str]:
+        p = str(path_like or "").strip()
+        if not p:
+            return None
+        try:
+            d = Path(p)
+            if d.suffix:
+                d = d.parent
+            d = d.resolve()
+            if d.exists() and d.is_dir():
+                return str(d)
+        except Exception:
+            return None
+        return None
+
+    def _initial_project_dir() -> Optional[str]:
+        return (
+            _existing_dir_or_none(cfg.last_project_dir())
+            or _existing_dir_or_none(state.project_path)
+            or _existing_dir_or_none(str(root))
+        )
+
+    def _initial_export_dir() -> Optional[str]:
+        return (
+            _existing_dir_or_none(cfg.last_export_dir())
+            or _existing_dir_or_none(state.project_path)
+            or _existing_dir_or_none(cfg.last_project_dir())
+            or _existing_dir_or_none(str(root))
+        )
 
     def _update_title() -> None:
         name = Path(state.project_path).name if state.project_path else "Untitled"
@@ -226,22 +269,143 @@ def main(page: ft.Page) -> None:
 
     _update_title()
 
-    def _track_clips(track: str):
-        return state.project.v_clips if track == "v" else state.project.a_clips
+    def _track_obj(track_id: Optional[str]):
+        if not track_id:
+            return None
+        return state.project.get_track(str(track_id))
 
-    def _set_track_clips(track: str, clips):
-        if track == "v":
-            state.project.v_clips = clips
-        else:
-            state.project.a_clips = clips
+    def _track_kind(track_id: Optional[str]) -> Optional[str]:
+        t = _track_obj(track_id)
+        return str(t.kind) if t is not None else None
 
-    def _find_clip(track: str, clip_id: str):
-        return next((c for c in _track_clips(track) if c.id == clip_id), None)
+    def _track_name(track_id: Optional[str]) -> str:
+        t = _track_obj(track_id)
+        return str(t.name) if t is not None else "-"
+
+    def _primary_video_track_id() -> str:
+        return state.project.primary_video_track().id
+
+    def _primary_audio_track_id() -> str:
+        return state.project.primary_audio_track().id
+
+    def _timeline_video_track():
+        for t in state.project.video_tracks:
+            if t.visible and t.clips:
+                return t
+        for t in state.project.video_tracks:
+            if t.clips:
+                return t
+        return state.project.primary_video_track()
+
+    def _timeline_video_track_id() -> str:
+        return _timeline_video_track().id
+
+    def _timeline_video_clips():
+        return list(_timeline_video_track().clips)
+
+    def _is_selected_video() -> bool:
+        return _track_kind(state.selected_track) == "video"
+
+    def _is_selected_audio() -> bool:
+        return _track_kind(state.selected_track) == "audio"
+
+    def _track_clips(track_id: str):
+        t = _track_obj(track_id)
+        return list(t.clips) if t is not None else []
+
+    def _set_track_clips(track_id: str, clips):
+        t = _track_obj(track_id)
+        if t is not None:
+            t.clips = list(clips)
+
+    def _find_clip(track_id: str, clip_id: str):
+        return next((c for c in _track_clips(track_id) if c.id == clip_id), None)
 
     def _selected_clip():
         if not state.selected_track or not state.selected_clip_id:
             return None
+        if _track_obj(state.selected_track) is None:
+            return None
         return _find_clip(state.selected_track, state.selected_clip_id)
+
+    def _get_timeline_ffmpeg() -> Optional[str]:
+        nonlocal timeline_ffmpeg_path, timeline_visual_disabled
+        if timeline_visual_disabled:
+            return None
+        if timeline_ffmpeg_path:
+            return timeline_ffmpeg_path
+        try:
+            ffmpeg, _ffprobe = resolve_ffmpeg_bins(root)
+            timeline_ffmpeg_path = ffmpeg
+            return timeline_ffmpeg_path
+        except Exception:
+            timeline_visual_disabled = True
+            return None
+
+    def _prepare_web_asset_src(src: str, bucket: str = "_timeline_cache") -> Optional[str]:
+        if not is_web:
+            return src
+        try:
+            src_path = Path(src)
+            if not src_path.exists():
+                return None
+
+            st = src_path.stat()
+            key = f"{bucket}|{src_path.resolve()}|{st.st_mtime_ns}|{st.st_size}"
+            cached = timeline_visual_web_cache.get(key)
+            if cached:
+                return cached
+
+            ext = (src_path.suffix or ".png").lower()
+            digest = hashlib.sha1(key.encode("utf-8", errors="ignore")).hexdigest()[:16]
+            rel = Path(bucket) / f"{digest}{ext}"
+            dst = root / "assets" / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+
+            if not dst.exists() or dst.stat().st_size != st.st_size:
+                shutil.copy2(src_path, dst)
+
+            rel_web = str(rel).replace("\\", "/")
+            timeline_visual_web_cache[key] = rel_web
+            return rel_web
+        except Exception:
+            return None
+
+    def _timeline_clip_visual_src(track_id: str, clip) -> Optional[str]:
+        ffmpeg = _get_timeline_ffmpeg()
+        if not ffmpeg:
+            return None
+        try:
+            kind = _track_kind(track_id)
+            if kind == "video":
+                img = generate_thumbnail(
+                    ffmpeg_path=ffmpeg,
+                    src=clip.src,
+                    in_sec=clip.in_sec,
+                    cache_dir=timeline_thumb_dir,
+                    width=320,
+                )
+                if not img:
+                    return None
+                return _prepare_web_asset_src(img, "_timeline_cache_v")
+
+            if kind != "audio":
+                return None
+
+            img = generate_waveform(
+                ffmpeg_path=ffmpeg,
+                src=clip.src,
+                in_sec=clip.in_sec,
+                duration=clip.dur,
+                cache_dir=timeline_wave_dir,
+                width=420,
+                height=42,
+            )
+            if not img:
+                return None
+            return _prepare_web_asset_src(img, "_timeline_cache_a")
+        except Exception:
+            return None
 
     # ---------- Undo / Redo ----------
     def _history_current(label: str = "(current)") -> HistoryEntry:
@@ -305,18 +469,20 @@ def main(page: ft.Page) -> None:
             redo_btn.tooltip = "Redo (Ctrl+Y)"
 
     def _select_neighbor(delta: int) -> None:
-        track = state.selected_track
-        if track not in ("v", "a"):
-            track = "v" if state.project.v_clips else ("a" if state.project.a_clips else None)
-        if track is None:
+        selected_track = _track_obj(state.selected_track)
+        if selected_track is None:
+            candidates = [t for t in state.project.tracks if t.clips]
+            selected_track = candidates[0] if candidates else state.project.primary_video_track()
+        if selected_track is None:
             return
 
-        clips = _track_clips(track)
+        track_id = selected_track.id
+        clips = _track_clips(track_id)
         if not clips:
             return
 
         idx = 0
-        if state.selected_track == track and state.selected_clip_id:
+        if state.selected_track == track_id and state.selected_clip_id:
             for i, c in enumerate(clips):
                 if c.id == state.selected_clip_id:
                     idx = i
@@ -326,7 +492,7 @@ def main(page: ft.Page) -> None:
         if new_idx == idx and state.selected_clip_id == clips[idx].id:
             return
 
-        state.selected_track = track
+        state.selected_track = track_id
         state.selected_clip_id = clips[new_idx].id
         update_inspector()
         refresh_timeline()
@@ -348,6 +514,10 @@ def main(page: ft.Page) -> None:
             save_click(None)
         elif not ctrl and key == "s":
             split_click(None)
+        elif not ctrl and key == "i":
+            trim_set_in_click(None)
+        elif not ctrl and key == "o":
+            trim_set_out_click(None)
         elif ctrl and key == "e":
             export_click(None)
         elif ctrl and key == "i":
@@ -529,20 +699,33 @@ def main(page: ft.Page) -> None:
     page.on_drop = on_file_drop
 
     def _open_project(path: str) -> None:
+        raw_path = str(path or "").strip()
+        if not raw_path:
+            return
         try:
-            state.project = load_project(path)
-            state.project_path = path
+            opened_path = str(Path(raw_path).resolve())
+        except Exception:
+            opened_path = raw_path
+        if not Path(opened_path).exists():
+            cfg.remove_recent_project(opened_path)
+            _refresh_recent_menu()
+            snack(f"Project not found: {Path(opened_path).name}")
+            return
+        try:
+            state.project = load_project(opened_path)
+            state.project_path = opened_path
             state.selected_clip_id = None
             state.selected_track = None
 
             history.clear()
             _refresh_history_controls()
 
-            cfg.add_recent_project(path)
+            cfg.add_recent_project(opened_path)
+            cfg.set_last_project_dir(opened_path)
             _mark_saved()
             _refresh_recent_menu()
 
-            snack(f"Opened: {Path(path).name}")
+            snack(f"Opened: {Path(opened_path).name}")
             update_inspector()
             refresh_timeline()
         except Exception as ex:
@@ -556,6 +739,18 @@ def main(page: ft.Page) -> None:
     def _refresh_recent_menu() -> None:
         items: List[ft.PopupMenuItem] = []
         recents = cfg.recent_projects(limit=10)
+        missing_paths: List[str] = []
+        for rp in recents:
+            try:
+                if not Path(rp.path).exists():
+                    missing_paths.append(rp.path)
+            except Exception:
+                missing_paths.append(rp.path)
+        if missing_paths:
+            for p in missing_paths:
+                cfg.remove_recent_project(p)
+            recents = cfg.recent_projects(limit=10)
+
         if not recents:
             items.append(ft.PopupMenuItem("No recent projects", disabled=True))
         else:
@@ -576,7 +771,7 @@ def main(page: ft.Page) -> None:
 
     audio = None
     if audio_preview_enabled:
-        # Non-visual audio player for A1 preview.
+        # Non-visual audio player for selected audio-track preview.
         audio = fta.Audio(volume=1.0)
         page.overlay.append(audio)
 
@@ -586,42 +781,268 @@ def main(page: ft.Page) -> None:
     split_label = ft.Text("Split: -")
     split_slider = ft.Slider(min=0, max=1, value=0.5, divisions=200)
 
-    trim_in = ft.TextField(label="In", width=110, dense=True)
-    trim_out = ft.TextField(label="Out", width=110, dense=True)
+    trim_min_piece_sec = 0.08
+    trim_in = ft.TextField(label="In", width=110, dense=True, hint_text="mm:ss")
+    trim_out = ft.TextField(label="Out", width=110, dense=True, hint_text="mm:ss")
+    trim_hint = ft.Text("", size=11, color=ft.Colors.WHITE70)
 
-    def trim_click(_e=None) -> None:
+    def _selected_source_duration(clip) -> Optional[float]:
+        mi = next((m for m in state.media if m.path == clip.src), None)
+        if mi:
+            try:
+                return float(mi.duration)
+            except Exception:
+                return None
+        return None
+
+    def _trim_anchor_source_sec(clip) -> float:
+        # Anchor trim helpers to the current split/playhead position inside the selected clip.
+        rel = 0.0
+        try:
+            if state.split_pos_clip_id == clip.id:
+                rel = float(state.split_pos_sec)
+            else:
+                rel = float(split_slider.value)
+        except Exception:
+            rel = 0.0
+        rel = max(0.0, min(clip.dur, rel))
+        return clip.in_sec + rel
+
+    def _apply_trim_values(new_in: float, new_out: float, action_label: str = "Trim") -> bool:
         if not state.selected_track or not state.selected_clip_id:
             snack("เลือกคลิปก่อน")
-            return
+            return False
         clip = _selected_clip()
         if not clip:
             snack("ไม่พบคลิป")
-            return
+            return False
 
+        try:
+            new_in = float(new_in)
+            new_out = float(new_out)
+        except Exception:
+            snack(f"{action_label}: รูปแบบเวลาไม่ถูกต้อง")
+            return False
+
+        src_dur = _selected_source_duration(clip)
+        if new_in < 0.0:
+            snack(f"{action_label}: in ต้องไม่ติดลบ")
+            return False
+        if src_dur is not None and new_in > src_dur - trim_min_piece_sec:
+            snack(f"{action_label}: in เกินช่วงไฟล์ ({_fmt_time(src_dur)})")
+            return False
+        if src_dur is not None and new_out > src_dur + 1e-6:
+            snack(f"{action_label}: out เกินความยาวไฟล์ ({_fmt_time(src_dur)})")
+            return False
+        if new_out <= new_in + trim_min_piece_sec:
+            snack(
+                f"{action_label}: ความยาวคลิปต้องมากกว่า {_fmt_time(trim_min_piece_sec)} "
+                f"(in={_fmt_time(new_in)} out={_fmt_time(new_out)})"
+            )
+            return False
+
+        # Keep split/playhead anchored to the same source time after trim.
+        anchor_source_sec = _trim_anchor_source_sec(clip)
+
+        before = _track_clips(state.selected_track)
+        clips, msg = trim_clip(
+            before,
+            clip.id,
+            new_in,
+            new_out,
+            min_piece_sec=trim_min_piece_sec,
+        )
+        if clips != before:
+            _history_record(f"Trim {clip.name}")
+            _set_track_clips(state.selected_track, clips)
+            _mark_dirty()
+            new_rel = max(0.0, min(new_out - new_in, anchor_source_sec - new_in))
+            state.split_pos_clip_id = clip.id
+            state.split_pos_sec = new_rel
+
+        snack(msg)
+        update_inspector()
+        refresh_timeline()
+        return clips != before
+
+    def trim_click(_e=None) -> None:
         new_in = _parse_time_input(trim_in.value)
         new_out = _parse_time_input(trim_out.value)
         if new_in is None or new_out is None:
             snack("Trim: รูปแบบเวลาไม่ถูกต้อง (ใส่วินาทีหรือ mm:ss)")
             return
+        _apply_trim_values(new_in, new_out, action_label="Trim")
 
-        # Best-effort duration validation if we know it (imported media).
-        mi = next((m for m in state.media if m.path == clip.src), None)
-        if mi and new_out > mi.duration + 1e-6:
-            snack(f"Trim: out เกินความยาวไฟล์ ({_fmt_time(mi.duration)})")
+    def trim_set_in_click(_e=None) -> None:
+        clip = _selected_clip()
+        if not clip:
+            snack("เลือกคลิปก่อน")
             return
+        anchor = _trim_anchor_source_sec(clip)
+        new_in = min(anchor, clip.out_sec - trim_min_piece_sec)
+        _apply_trim_values(new_in, clip.out_sec, action_label="Set In")
 
-        before = _track_clips(state.selected_track)
-        clips, msg = trim_clip(before, clip.id, new_in, new_out)
-        if clips != before:
-            _history_record(f"Trim {clip.name}")
-            _set_track_clips(state.selected_track, clips)
-            _mark_dirty()
-        snack(msg)
-        update_inspector()
-        refresh_timeline()
+    def trim_set_out_click(_e=None) -> None:
+        clip = _selected_clip()
+        if not clip:
+            snack("เลือกคลิปก่อน")
+            return
+        anchor = _trim_anchor_source_sec(clip)
+        new_out = max(anchor, clip.in_sec + trim_min_piece_sec)
+        src_dur = _selected_source_duration(clip)
+        if src_dur is not None:
+            new_out = min(new_out, src_dur)
+        _apply_trim_values(clip.in_sec, new_out, action_label="Set Out")
+
+    def trim_reset_click(_e=None) -> None:
+        clip = _selected_clip()
+        if not clip:
+            snack("เลือกคลิปก่อน")
+            return
+        src_dur = _selected_source_duration(clip)
+        if src_dur is None:
+            snack("Reset Trim ใช้ได้เมื่อไฟล์อยู่ใน Media Bin")
+            return
+        _apply_trim_values(0.0, src_dur, action_label="Reset Trim")
 
     trim_apply = ft.FilledButton("Apply Trim", icon=ft.Icons.CUT, on_click=trim_click)
-    trim_row = ft.Row([trim_in, trim_out, trim_apply], visible=False, spacing=6)
+    trim_set_in = ft.OutlinedButton("Set In @ Split", icon=ft.Icons.FIRST_PAGE, on_click=trim_set_in_click)
+    trim_set_out = ft.OutlinedButton("Set Out @ Split", icon=ft.Icons.LAST_PAGE, on_click=trim_set_out_click)
+    trim_reset = ft.TextButton("Reset", icon=ft.Icons.RESTART_ALT, on_click=trim_reset_click)
+    trim_in.on_submit = trim_click
+    trim_out.on_submit = trim_click
+    trim_row = ft.Column(
+        [
+            ft.Row([trim_in, trim_out, trim_apply], spacing=6),
+            ft.Row([trim_set_in, trim_set_out, trim_reset], spacing=6),
+            trim_hint,
+        ],
+        visible=False,
+        spacing=4,
+        tight=True,
+    )
+
+    # ---------- Transition controls (video tracks) ----------
+    transition_kind = ft.Dropdown(
+        width=170,
+        dense=True,
+        label="Transition In",
+        value="none",
+        options=[
+            ft.dropdown.Option(key="none", text="None"),
+            ft.dropdown.Option(key="fade", text="Fade"),
+            ft.dropdown.Option(key="crossfade", text="Crossfade"),
+            ft.dropdown.Option(key="dissolve", text="Dissolve"),
+        ],
+    )
+    transition_dur_value = ft.Text("0.50s", size=12, color=ft.Colors.WHITE70)
+    transition_dur = ft.Slider(min=0.05, max=2.0, value=0.5, divisions=39)
+    transition_hint = ft.Text("", size=11, color=ft.Colors.WHITE70)
+
+    def _selected_v_clip_index() -> int:
+        if not _is_selected_video() or not state.selected_track or not state.selected_clip_id:
+            return -1
+        for i, c in enumerate(_track_clips(state.selected_track)):
+            if c.id == state.selected_clip_id:
+                return i
+        return -1
+
+    def _set_selected_clip_transition(kind: str, duration: float) -> bool:
+        track_id = state.selected_track
+        track = _track_obj(track_id)
+        idx = _selected_v_clip_index()
+        if idx < 0 or not track_id or track is None or track.kind != "video":
+            snack("เลือกคลิปวิดีโอก่อน")
+            return False
+        if idx == 0:
+            snack("คลิปแรกไม่สามารถมี Transition In ได้")
+            return False
+        clips_on_track = _track_clips(track_id)
+        clip = clips_on_track[idx]
+        prev = clips_on_track[idx - 1]
+
+        k = str(kind or "none").strip().lower()
+        if k in ("", "none", "off"):
+            new_transition = None
+        else:
+            if k not in ("fade", "crossfade", "dissolve"):
+                k = "fade"
+            max_allowed = max(0.0, min(prev.dur, clip.dur) - 0.01)
+            if max_allowed < 0.05:
+                snack("คลิปสั้นเกินไปสำหรับ transition")
+                return False
+            d = min(max_allowed, max(0.05, float(duration)))
+            new_transition = Transition(kind=k, duration=d)
+
+        before = clips_on_track
+        out = []
+        changed = False
+        for c in before:
+            if c.id != clip.id:
+                out.append(c)
+                continue
+            nc = replace(c, transition_in=new_transition)
+            out.append(nc)
+            changed = changed or (nc != c)
+
+        if not changed:
+            return False
+        _history_record(f"Transition {track.name}:{clip.name}")
+        _set_track_clips(track_id, out)
+        _mark_dirty()
+        update_inspector()
+        refresh_timeline()
+        return True
+
+    def on_transition_dur_change(e: ft.ControlEvent) -> None:
+        try:
+            transition_dur_value.value = f"{float(e.control.value):.2f}s"
+        except Exception:
+            transition_dur_value.value = "-"
+        transition_dur_value.update()
+
+    def on_transition_kind_change(_e: ft.ControlEvent) -> None:
+        k = str(transition_kind.value or "none").strip().lower()
+        is_none = k in ("", "none", "off")
+        transition_dur.disabled = is_none
+        if is_none:
+            transition_hint.value = "Transition is off. Choose a type then Apply."
+        else:
+            try:
+                transition_hint.value = f"Selected {k} ({float(transition_dur.value):.2f}s). Click Apply."
+            except Exception:
+                transition_hint.value = f"Selected {k}. Click Apply."
+        transition_panel.update()
+
+    def transition_apply_click(_e=None) -> None:
+        kind = str(transition_kind.value or "none")
+        try:
+            dur = float(transition_dur.value)
+        except Exception:
+            dur = 0.5
+        changed = _set_selected_clip_transition(kind, dur)
+        if changed:
+            snack("Transition updated")
+
+    transition_dur.on_change = on_transition_dur_change
+    transition_kind.on_change = on_transition_kind_change
+    transition_apply = ft.OutlinedButton(
+        "Apply Transition",
+        icon=ft.Icons.AUTO_FIX_HIGH,
+        on_click=transition_apply_click,
+    )
+    transition_panel = ft.Column(
+        [
+            ft.Text("Transition", weight=ft.FontWeight.BOLD, size=12),
+            ft.Row([transition_kind, ft.Container(expand=True), transition_dur_value], tight=True),
+            transition_dur,
+            ft.Row([transition_apply], tight=True),
+            transition_hint,
+        ],
+        visible=False,
+        spacing=4,
+        tight=True,
+    )
 
     # ---------- Clip audio controls (export-time) ----------
     volume_title = ft.Text("Audio", weight=ft.FontWeight.BOLD, size=12)
@@ -640,6 +1061,15 @@ def main(page: ft.Page) -> None:
         tight=True,
     )
 
+    preview_hint = ft.Text("Preview (optional)", color=ft.Colors.WHITE70)
+    preview_hint_layer = ft.Container(
+        expand=True,
+        alignment=ft.Alignment(0, 0),
+        content=preview_hint,
+        visible=True,
+    )
+    preview_video_slot = ft.Container(expand=True)
+
     # Keep the preview reasonably small so the timeline stays visible in typical browser heights.
     preview_host = ft.Container(
         height=200,
@@ -647,7 +1077,7 @@ def main(page: ft.Page) -> None:
         bgcolor=ft.Colors.BLACK,
         # Some Flet versions don't expose `ft.alignment.*`; Alignment(x, y) is stable.
         alignment=ft.Alignment(0, 0),
-        content=ft.Text("Preview (optional)", color=ft.Colors.WHITE70),
+        content=ft.Stack([preview_video_slot, preview_hint_layer], expand=True),
     )
 
     audio_pos = ft.Text("", size=12, color=ft.Colors.WHITE70, visible=False)
@@ -659,7 +1089,7 @@ def main(page: ft.Page) -> None:
 
         # flet_audio Audio methods are async; schedule them on the page task loop.
         target_ms = None
-        if clip and state.selected_track == "a":
+        if clip and _is_selected_audio():
             if audio.src != clip.src:
                 audio.src = clip.src
                 audio.update()
@@ -695,12 +1125,12 @@ def main(page: ft.Page) -> None:
         if not audio_preview_enabled or audio is None:
             snack("ปิดพรีวิวเสียงอยู่ (ตั้งค่า MINICUT_AUDIO_PREVIEW=1 เพื่อเปิดใช้งาน)")
             return
-        if state.selected_track != "a":
-            snack("เลือกคลิปเสียง (A1) ก่อน")
+        if not _is_selected_audio():
+            snack("เลือกคลิปเสียงก่อน")
             return
         clip = _selected_clip()
         if not clip:
-            snack("เลือกคลิปเสียง (A1) ก่อน")
+            snack("เลือกคลิปเสียงก่อน")
             return
 
         # Ensure backend knows the latest src before invoking methods.
@@ -747,7 +1177,7 @@ def main(page: ft.Page) -> None:
     def on_audio_position(e: fta.AudioPositionChangeEvent) -> None:
         if not audio_preview_enabled:
             return
-        if state.selected_track != "a":
+        if not _is_selected_audio():
             return
         clip = _selected_clip()
         if not clip:
@@ -767,7 +1197,7 @@ def main(page: ft.Page) -> None:
     def _set_selected_clip_audio(volume: Optional[float] = None, muted: Optional[bool] = None, label: str = "Audio") -> None:
         clip = _selected_clip()
         track = state.selected_track
-        if not clip or track not in ("v", "a"):
+        if not clip or not track or _track_obj(track) is None:
             return
 
         before = _track_clips(track)
@@ -826,18 +1256,30 @@ def main(page: ft.Page) -> None:
     volume_slider.on_change_end = on_volume_change_end
     mute_checkbox.on_change = on_mute_change
 
+    def _preview_ready() -> bool:
+        return bool(preview_video and preview_video_src and _is_selected_video())
+
     def play_click(_e=None):
+        nonlocal playback_loop_id
         clip = _selected_clip()
-        if not clip or not preview_video:
+        if not clip or not _preview_ready():
             return
+        if state.is_playing:
+            stop_playback()
         clip_start = v_start_sec_map.get(clip.id, 0.0)
         clip_end = clip_start + clip.dur
         if state.playhead_sec < clip_start or state.playhead_sec > clip_end:
             state.playhead_sec = clip_start
         state.is_playing = True
         state.playhead_clip_id = clip.id
-        _run_sync_video_to_playhead(resume=True)
-        page.run_task(_playhead_loop)
+        playback_loop_id += 1
+        loop_id = playback_loop_id
+        _run_sync_video_to_playhead(resume=True, expected_playback_id=loop_id)
+
+        async def _runner() -> None:
+            await _playhead_loop(loop_id)
+
+        page.run_task(_runner)
 
     def pause_click(_e=None):
         stop_playback()
@@ -851,13 +1293,17 @@ def main(page: ft.Page) -> None:
             _run_sync_video_to_playhead(resume=False)
             update_playhead_ui()
 
-    async def _sync_video_to_playhead(resume: bool = False) -> None:
-        nonlocal preview_video
-        if not preview_video:
+    async def _sync_video_to_playhead(resume: bool = False, expected_playback_id: Optional[int] = None) -> None:
+        nonlocal preview_video, playback_loop_id
+        if expected_playback_id is not None and expected_playback_id != playback_loop_id:
+            return
+        if not _preview_ready() or not preview_video:
+            return
+        clip = _selected_clip()
+        if not clip:
             return
         seek_sec = max(0.0, state.playhead_sec)
-        clip = _selected_clip()
-        if clip and state.playhead_clip_id == clip.id:
+        if state.playhead_clip_id == clip.id:
             clip_start = v_start_sec_map.get(clip.id, 0.0)
             rel = max(0.0, min(clip.dur, state.playhead_sec - clip_start))
             seek_sec = clip.in_sec + rel
@@ -865,26 +1311,34 @@ def main(page: ft.Page) -> None:
             await preview_video.pause()
         except Exception:
             pass
+        if expected_playback_id is not None and expected_playback_id != playback_loop_id:
+            return
         try:
             await preview_video.seek(int(seek_sec * 1000))
         except Exception:
             pass
+        if expected_playback_id is not None and expected_playback_id != playback_loop_id:
+            return
         if resume:
             try:
                 await preview_video.play()
             except Exception:
                 pass
 
-    def _run_sync_video_to_playhead(resume: bool = False) -> None:
+    def _run_sync_video_to_playhead(
+        resume: bool = False,
+        expected_playback_id: Optional[int] = None,
+    ) -> None:
         async def _do() -> None:
-            await _sync_video_to_playhead(resume=resume)
+            await _sync_video_to_playhead(resume=resume, expected_playback_id=expected_playback_id)
 
         page.run_task(_do)
 
     def stop_playback() -> None:
-        nonlocal preview_video
+        nonlocal preview_video, playback_loop_id
         state.is_playing = False
-        if preview_video:
+        playback_loop_id += 1
+        if preview_video and preview_video_src:
             pv = preview_video
 
             async def _pause_video() -> None:
@@ -895,25 +1349,48 @@ def main(page: ft.Page) -> None:
 
             page.run_task(_pause_video)
 
-    async def _playhead_loop() -> None:
-        nonlocal preview_video
+    async def _playhead_loop(loop_id: int) -> None:
+        nonlocal preview_video, playback_loop_id
         last_tick = time.perf_counter()
         stale_ticks = 0
-        while state.is_playing and preview_video:
+        anchor_clip_id: Optional[str] = None
+        anchor_base_rel = 0.0
+        clock_origin_wall = last_tick
+        clock_origin_rel = 0.0
+        startup_mode = True
+        startup_deadline = last_tick + 0.35
+        while state.is_playing and loop_id == playback_loop_id and preview_video and preview_video_src:
             clip = _selected_clip()
-            if not clip:
+            if not clip or not _is_selected_video():
                 stop_playback()
                 break
             clip_start = v_start_sec_map.get(clip.id, 0.0)
             prev_rel_sec = max(0.0, min(clip.dur, state.playhead_sec - clip_start))
             now = time.perf_counter()
-            dt = max(0.0, now - last_tick)
             last_tick = now
+
+            # Re-anchor the wall-clock model when playback clip changes.
+            if anchor_clip_id != clip.id:
+                anchor_clip_id = clip.id
+                anchor_base_rel = prev_rel_sec
+                clock_origin_wall = now
+                clock_origin_rel = prev_rel_sec
+                startup_mode = True
+                startup_deadline = now + 0.35
+                stale_ticks = 0
+
+            expected_rel = max(
+                0.0,
+                min(clip.dur, clock_origin_rel + max(0.0, now - clock_origin_wall)),
+            )
 
             try:
                 pos_raw = await preview_video.get_current_position()
             except Exception:
                 pos_raw = None
+
+            if loop_id != playback_loop_id or not state.is_playing:
+                break
 
             pos_sec: Optional[float] = None
             if pos_raw is not None:
@@ -927,16 +1404,11 @@ def main(page: ft.Page) -> None:
                 except Exception:
                     pos_sec = None
 
-            wall_rel_sec = prev_rel_sec + dt
-            if pos_sec is None:
-                # Web backend can occasionally return no position; keep playhead moving by wall-clock.
-                rel_sec = wall_rel_sec
-                stale_ticks = 0
-            else:
+            rel_backend: Optional[float] = None
+            if pos_sec is not None:
                 # Backends may report clip-relative time or absolute source time.
                 rel_from_relative = max(0.0, min(clip.dur, pos_sec))
                 rel_from_absolute = max(0.0, min(clip.dur, pos_sec - clip.in_sec))
-                expected_rel = max(0.0, min(clip.dur, wall_rel_sec))
 
                 # Pick the interpretation closest to the expected forward progression.
                 if abs(rel_from_absolute - expected_rel) + 1e-6 < abs(rel_from_relative - expected_rel):
@@ -944,16 +1416,42 @@ def main(page: ft.Page) -> None:
                 else:
                     rel_backend = rel_from_relative
 
+            # Avoid racing ahead during startup while the media backend is still ramping up.
+            if startup_mode:
+                if rel_backend is not None and rel_backend > anchor_base_rel + 0.015:
+                    startup_mode = False
+                    clock_origin_wall = now
+                    clock_origin_rel = rel_backend
+                    expected_rel = rel_backend
+                elif now >= startup_deadline:
+                    startup_mode = False
+
+            if rel_backend is None:
+                # Keep UI moving by the wall-clock model when backend position is unavailable.
+                rel_sec = expected_rel
+                stale_ticks = 0
+            else:
                 # If backend time is stale/regressing, blend toward wall-clock progression.
                 if rel_backend <= prev_rel_sec + 0.001:
                     stale_ticks += 1
                 else:
                     stale_ticks = 0
 
+                # Clamp backend jitter so playhead pace stays close to 1:1 wall-clock timing.
+                max_trail_sec = 0.05
+                max_lead_sec = 0.12
+                lo = max(0.0, expected_rel - max_trail_sec)
+                hi = min(clip.dur, expected_rel + max_lead_sec)
+                rel_fused = min(hi, max(lo, rel_backend))
+
                 if stale_ticks >= 2:
-                    rel_sec = max(rel_backend, wall_rel_sec)
+                    rel_sec = expected_rel
                 else:
-                    rel_sec = rel_backend
+                    rel_sec = rel_fused
+
+            # Playback should be monotonic while actively running.
+            if (not startup_mode) and rel_sec < prev_rel_sec and prev_rel_sec < clip.dur - 0.02:
+                rel_sec = prev_rel_sec
 
             rel_sec = max(0.0, min(clip.dur, rel_sec))
             state.playhead_clip_id = clip.id
@@ -976,18 +1474,19 @@ def main(page: ft.Page) -> None:
     def _timeline_x_to_v1_position(x_px: float) -> tuple[Optional[str], float, float]:
         """
         Convert timeline X (same coordinate space as playhead_line center) to:
-        (clip_id, global_sec_on_v1, sec_from_clip_start).
+        (clip_id, global_sec_on_timeline_video, sec_from_clip_start).
         """
-        if not state.project.v_clips:
+        timeline_clips = _timeline_video_clips()
+        if not timeline_clips:
             return None, 0.0, 0.0
 
         x = float(x_px)
-        first = state.project.v_clips[0]
+        first = timeline_clips[0]
         first_start_px = v_start_px_map.get(first.id, 0.0)
         if x <= first_start_px:
             return first.id, v_start_sec_map.get(first.id, 0.0), 0.0
 
-        for c in state.project.v_clips:
+        for c in timeline_clips:
             start_px = v_start_px_map.get(c.id, 0.0)
             width_px = max(1.0, float(v_clip_width_px_map.get(c.id, max(1.0, c.dur * state.px_per_sec))))
             end_px = start_px + width_px
@@ -997,7 +1496,7 @@ def main(page: ft.Page) -> None:
                 rel_sec = c.dur * ratio
                 return c.id, start_sec + rel_sec, rel_sec
 
-        last = state.project.v_clips[-1]
+        last = timeline_clips[-1]
         last_start_sec = v_start_sec_map.get(last.id, 0.0)
         return last.id, last_start_sec + last.dur, last.dur
 
@@ -1014,8 +1513,9 @@ def main(page: ft.Page) -> None:
         state.split_pos_clip_id = clip_id
         state.split_pos_sec = rel_sec
 
-        selection_changed = state.selected_track != "v" or state.selected_clip_id != clip_id
-        state.selected_track = "v"
+        v_track_id = _timeline_video_track_id()
+        selection_changed = state.selected_track != v_track_id or state.selected_clip_id != clip_id
+        state.selected_track = v_track_id
         state.selected_clip_id = clip_id
 
         if selection_changed:
@@ -1042,7 +1542,8 @@ def main(page: ft.Page) -> None:
         playhead_line.visible = True
         sec = max(0.0, state.playhead_sec)
         px = None
-        for c in state.project.v_clips:
+        timeline_clips = _timeline_video_clips()
+        for c in timeline_clips:
             start_sec = v_start_sec_map.get(c.id, 0.0)
             end_sec = start_sec + c.dur
             start_px = v_start_px_map.get(c.id, 0.0)
@@ -1052,9 +1553,9 @@ def main(page: ft.Page) -> None:
                 px = start_px + max(0.0, min(1.0, rel)) * width_px
                 break
         if px is None:
-            if state.project.v_clips:
-                first = state.project.v_clips[0]
-                last = state.project.v_clips[-1]
+            if timeline_clips:
+                first = timeline_clips[0]
+                last = timeline_clips[-1]
                 first_px = v_start_px_map.get(first.id, 0.0)
                 last_px = v_start_px_map.get(last.id, 0.0) + max(
                     0.0,
@@ -1072,7 +1573,7 @@ def main(page: ft.Page) -> None:
         except Exception:
             pass
         try:
-            v_row.update()
+            timeline_tracks_col.update()
         except Exception:
             pass
         try:
@@ -1144,20 +1645,20 @@ def main(page: ft.Page) -> None:
     def on_timeline_tap_down(e: ft.TapEvent) -> None:
         x, y = _event_local_xy(e)
         # Ignore top info/zoom row taps.
-        if y < 36:
+        if y < timeline_header_h:
             return
         _set_playhead_from_timeline_x(x - timeline_v1_left_offset, from_drag=False)
 
     def on_timeline_pan_down(e: ft.DragDownEvent) -> None:
         x, y = _event_local_xy(e)
-        if y < 36:
+        if y < timeline_header_h:
             return
         _set_playhead_from_timeline_x(x - timeline_v1_left_offset, from_drag=False)
 
     def on_timeline_pan_start(e: ft.DragStartEvent) -> None:
         nonlocal timeline_pan_active, timeline_pan_start_pointer_x, timeline_pan_start_playhead_x
         _x, y = _event_local_xy(e)
-        timeline_pan_active = y >= 36
+        timeline_pan_active = y >= timeline_header_h
         gx = _event_global_x(e)
         timeline_pan_start_pointer_x = float(gx) if gx is not None else 0.0
         timeline_pan_start_playhead_x = _playhead_timeline_x()
@@ -1197,7 +1698,7 @@ def main(page: ft.Page) -> None:
     def on_timeline_right_pan_start(e: ft.PointerEvent) -> None:
         nonlocal timeline_pan_active, timeline_pan_start_pointer_x, timeline_pan_start_playhead_x
         x, y = _event_local_xy(e)
-        timeline_pan_active = y >= 36
+        timeline_pan_active = y >= timeline_header_h
         timeline_pan_start_pointer_x = x
         timeline_pan_start_playhead_x = _playhead_timeline_x()
         if timeline_pan_active and state.is_playing:
@@ -1225,6 +1726,8 @@ def main(page: ft.Page) -> None:
     playhead_handle.on_tap_down = on_playhead_tap_down
 
     def update_inspector() -> None:
+        nonlocal preview_video, preview_video_src
+
         def _prepare_web_preview_src(src: str) -> Optional[str]:
             if not is_web:
                 return src
@@ -1272,26 +1775,126 @@ def main(page: ft.Page) -> None:
             state.playhead_sec = 0.0
             trim_in.value = ""
             trim_out.value = ""
+            trim_hint.value = ""
             trim_row.visible = False
+            transition_panel.visible = False
+            transition_kind.value = "none"
+            transition_kind.disabled = True
+            transition_dur.min = 0.05
+            transition_dur.max = 2.0
+            transition_dur.value = 0.5
+            transition_dur.divisions = 39
+            transition_dur.disabled = True
+            transition_dur_value.value = "0.50s"
+            transition_apply.disabled = True
+            transition_hint.value = ""
             audio_edit_panel.visible = False
             audio_controls.visible = False
             audio_pos.visible = False
             _stop_audio_to_clip_start()
-            preview_host.content = ft.Text("Preview (optional)", color=ft.Colors.WHITE70)
-            nonlocal preview_video
-            preview_video = None
             stop_playback()
+            preview_video_src = None
+            if preview_video:
+                preview_video.visible = False
+            preview_hint.value = "Preview (optional)"
+            preview_hint_layer.visible = True
             update_playhead_ui()
             page.update()
             return
 
-        prefix = "[V1]" if state.selected_track == "v" else "[A1]"
+        prefix = f"[{_track_name(state.selected_track)}]"
         selected_title.value = f"{prefix} {clip.name}"
         selected_range.value = f"in={_fmt_time(clip.in_sec)}  out={_fmt_time(clip.out_sec)}  dur={_fmt_time(clip.dur)}"
         trim_in.value = _fmt_time(clip.in_sec)
         trim_out.value = _fmt_time(clip.out_sec)
+        src_dur = _selected_source_duration(clip)
+        if src_dur is not None:
+            trim_hint.value = (
+                f"Source: {_fmt_time(src_dur)} | Clip: {_fmt_time(clip.dur)} "
+                f"| Min trim length: {_fmt_time(trim_min_piece_sec)}"
+            )
+        else:
+            trim_hint.value = (
+                f"Clip: {_fmt_time(clip.dur)} | Min trim length: {_fmt_time(trim_min_piece_sec)} "
+                "(source duration unknown)"
+            )
         trim_row.visible = True
         audio_edit_panel.visible = True
+
+        if _is_selected_video():
+            transition_panel.visible = True
+            transition_apply.disabled = False
+            transition_kind.disabled = False
+
+            v_idx = _selected_v_clip_index()
+            trans = getattr(clip, "transition_in", None)
+            trans_kind = "none"
+            trans_dur = 0.5
+            if trans is not None:
+                trans_kind = str(getattr(trans, "kind", "fade") or "fade").strip().lower()
+                if trans_kind not in ("fade", "crossfade", "dissolve"):
+                    trans_kind = "fade"
+                try:
+                    trans_dur = float(getattr(trans, "duration", 0.5) or 0.5)
+                except Exception:
+                    trans_dur = 0.5
+
+            if v_idx <= 0:
+                transition_kind.value = "none"
+                transition_kind.disabled = True
+                transition_dur.min = 0.05
+                transition_dur.max = 2.0
+                transition_dur.divisions = 39
+                transition_dur.value = 0.5
+                transition_dur.disabled = True
+                transition_dur_value.value = "0.50s"
+                transition_apply.disabled = True
+                transition_hint.value = "First clip cannot have Transition In."
+            else:
+                selected_track_id = state.selected_track
+                prev = _track_clips(selected_track_id)[v_idx - 1] if selected_track_id else None
+                if prev is None:
+                    transition_kind.value = "none"
+                    transition_kind.disabled = True
+                    transition_dur.disabled = True
+                    transition_apply.disabled = True
+                    transition_hint.value = "Transition unavailable"
+                else:
+                    max_allowed = max(0.0, min(prev.dur, clip.dur) - 0.01)
+                    if max_allowed < 0.05:
+                        transition_kind.value = "none"
+                        transition_kind.disabled = True
+                        transition_dur.min = 0.05
+                        transition_dur.max = 0.05
+                        transition_dur.divisions = 1
+                        transition_dur.value = 0.05
+                        transition_dur.disabled = True
+                        transition_dur_value.value = "0.05s"
+                        transition_apply.disabled = True
+                        transition_hint.value = "Clips are too short for transition (need >= 0.05s overlap)."
+                    else:
+                        transition_kind.value = trans_kind
+                        transition_dur.min = 0.05
+                        transition_dur.max = max_allowed
+                        steps = int(round((max_allowed - 0.05) / 0.01))
+                        transition_dur.divisions = max(1, min(200, steps))
+                        clamped_dur = max(0.05, min(max_allowed, trans_dur))
+                        transition_dur.value = clamped_dur
+                        transition_dur.disabled = trans_kind == "none"
+                        transition_dur_value.value = f"{clamped_dur:.2f}s"
+                        if trans_kind == "none":
+                            transition_hint.value = f"Max overlap: {_fmt_time(max_allowed)}"
+                        else:
+                            transition_hint.value = (
+                                f"{trans_kind} {_fmt_time(clamped_dur)} (max {_fmt_time(max_allowed)})"
+                            )
+        else:
+            transition_panel.visible = False
+            transition_kind.value = "none"
+            transition_kind.disabled = True
+            transition_dur.disabled = True
+            transition_apply.disabled = True
+            transition_hint.value = ""
 
         try:
             volume_slider.value = float(getattr(clip, "volume", 1.0) or 1.0)
@@ -1318,42 +1921,53 @@ def main(page: ft.Page) -> None:
             else:
                 state.playhead_sec = clip_start_sec
 
-        if state.selected_track == "v":
+        if _is_selected_video():
             audio_controls.visible = False
             audio_pos.visible = False
             _stop_audio_to_clip_start()
             preview_src = _prepare_web_preview_src(clip.src)
             if preview_src:
-                pv = ftv.Video(
-                    expand=True,
-                    playlist=[ftv.VideoMedia(preview_src)],
-                    autoplay=False,
-                    muted=True,
-                    show_controls=True,
-                )
-                preview_host.content = pv
-                preview_video = pv
+                if preview_video is None:
+                    preview_video = ftv.Video(
+                        expand=True,
+                        playlist=[ftv.VideoMedia(preview_src)],
+                        autoplay=False,
+                        muted=True,
+                        show_controls=True,
+                        visible=True,
+                    )
+                    preview_video_slot.content = preview_video
+                    preview_video_src = preview_src
+                elif preview_video_src != preview_src:
+                    stop_playback()
+                    preview_video.playlist = [ftv.VideoMedia(preview_src)]
+                    preview_video_src = preview_src
+                preview_video.visible = True
+                preview_hint_layer.visible = False
             else:
-                preview_host.content = ft.Text("Preview load failed", color=ft.Colors.WHITE70)
-                preview_video = None
+                stop_playback()
+                preview_video_src = None
+                if preview_video:
+                    preview_video.visible = False
+                preview_hint.value = "Preview load failed"
+                preview_hint_layer.visible = True
         else:
             audio_controls.visible = audio_preview_enabled
             audio_pos.visible = audio_preview_enabled
             _stop_audio_to_clip_start()
             audio_pos.value = f"{_fmt_time(0.0)} / {_fmt_time(clip.dur)}"
+            stop_playback()
+            preview_video_src = None
+            if preview_video:
+                preview_video.visible = False
             if audio_preview_enabled:
-                preview_host.content = ft.Text(
-                    "Audio selected: use controls below to listen",
-                    color=ft.Colors.WHITE70,
-                )
+                preview_hint.value = "Audio selected: use controls below to listen"
             else:
-                preview_host.content = ft.Text(
-                    "ปิดพรีวิวเสียงอยู่ (ตั้งค่า MINICUT_AUDIO_PREVIEW=1 เพื่อเปิดใช้งาน)",
-                    color=ft.Colors.WHITE70,
-                )
-            preview_video = None
+                preview_hint.value = "ปิดพรีวิวเสียงอยู่ (ตั้งค่า MINICUT_AUDIO_PREVIEW=1 เพื่อเปิดใช้งาน)"
+            preview_hint_layer.visible = True
         update_playhead_ui()
-        _run_sync_video_to_playhead(resume=False)
+        if _is_selected_video() and preview_video_src:
+            _run_sync_video_to_playhead(resume=False)
         page.update()
 
     def on_split_slider(e: ft.ControlEvent) -> None:
@@ -1368,11 +1982,16 @@ def main(page: ft.Page) -> None:
         # Move playhead to match split slider position.
         clip = _selected_clip()
         if clip and state.selected_clip_id:
-            start = v_start_sec_map.get(state.selected_clip_id, clip.in_sec)
+            start = (
+                v_start_sec_map.get(state.selected_clip_id, clip.in_sec)
+                if state.selected_track == _timeline_video_track_id()
+                else 0.0
+            )
             state.playhead_clip_id = state.selected_clip_id
             state.playhead_sec = start + val
             update_playhead_ui()
-            _run_sync_video_to_playhead(resume=False)
+            if state.selected_track == _timeline_video_track_id():
+                _run_sync_video_to_playhead(resume=False)
         refresh_timeline()
 
     split_slider.on_change = on_split_slider
@@ -1381,8 +2000,7 @@ def main(page: ft.Page) -> None:
     timeline_zoom = ft.Slider(min=20, max=180, value=state.px_per_sec, divisions=160)
     timeline_info = ft.Text("Timeline: 0 clips", size=12, color=ft.Colors.WHITE70)
 
-    v_row = ft.Row(spacing=6, scroll=ft.ScrollMode.AUTO)
-    a_row = ft.Row(spacing=6, scroll=ft.ScrollMode.AUTO)
+    timeline_tracks_col = ft.Column(spacing=6, expand=True)
 
     def on_zoom(e: ft.ControlEvent) -> None:
         state.px_per_sec = float(timeline_zoom.value)
@@ -1390,18 +2008,20 @@ def main(page: ft.Page) -> None:
 
     timeline_zoom.on_change = on_zoom
 
-    def clip_block(track: str, clip_id: str) -> ft.Control:
-        clip = _find_clip(track, clip_id)
+    def clip_block(track_id: str, clip_id: str) -> ft.Control:
+        track = _track_obj(track_id)
+        assert track is not None
+        clip = _find_clip(track_id, clip_id)
         assert clip is not None
 
-        is_audio = track == "a"
+        is_audio = track.kind == "audio"
         dur_px = max(70, int(clip.dur * state.px_per_sec))
         color = ft.Colors.GREEN_600 if is_audio else ft.Colors.BLUE_600
-        selected = state.selected_track == track and state.selected_clip_id == clip.id
+        selected = state.selected_track == track_id and state.selected_clip_id == clip.id
         label = f"A: {clip.name}" if is_audio else clip.name
 
         def _select_at(position_px: float | None = None) -> None:
-            state.selected_track = track
+            state.selected_track = track_id
             state.selected_clip_id = clip.id
             state.playhead_clip_id = clip.id
             # If user clicked within the clip, set split position to that proportion.
@@ -1409,21 +2029,51 @@ def main(page: ft.Page) -> None:
                 ratio = max(0.0, min(1.0, position_px / dur_px))
                 state.split_pos_clip_id = clip.id
                 state.split_pos_sec = max(0.0, min(clip.dur, clip.dur * ratio))
-                state.playhead_sec = v_start_sec_map.get(clip.id, 0.0) + state.split_pos_sec
+                if track_id == _timeline_video_track_id():
+                    state.playhead_sec = v_start_sec_map.get(clip.id, 0.0) + state.split_pos_sec
                 update_playhead_ui()
                 _run_sync_video_to_playhead(resume=False)
             update_inspector()
             refresh_timeline()
 
         block_height = 28 if is_audio else 36
-        cont = ft.Container(
-            width=dur_px,
-            height=block_height,
-            padding=6,
-            border_radius=8,
-            bgcolor=ft.Colors.AMBER_600 if selected else color,
-            content=ft.Text(label, size=12, no_wrap=True),
-        )
+        visual_src = _timeline_clip_visual_src(track_id, clip)
+        if visual_src:
+            overlay_tint = ft.Colors.AMBER_900 if selected else ft.Colors.BLACK54
+            label_bg = ft.Colors.AMBER_800 if selected else ft.Colors.BLACK54
+            cont = ft.Container(
+                width=dur_px,
+                height=block_height,
+                border_radius=8,
+                clip_behavior=ft.ClipBehavior.HARD_EDGE,
+                border=ft.Border.all(1, ft.Colors.AMBER_300 if selected else ft.Colors.WHITE24),
+                content=ft.Stack(
+                    controls=[
+                        ft.Image(src=visual_src, width=dur_px, height=block_height, fit=ft.ImageFit.COVER),
+                        ft.Container(width=dur_px, height=block_height, bgcolor=overlay_tint, opacity=0.30),
+                        ft.Container(
+                            width=dur_px,
+                            height=block_height,
+                            padding=6,
+                            alignment=ft.Alignment(-1, 0),
+                            bgcolor=label_bg,
+                            opacity=0.85,
+                            content=ft.Text(label, size=12, no_wrap=True),
+                        ),
+                    ],
+                    width=dur_px,
+                    height=block_height,
+                ),
+            )
+        else:
+            cont = ft.Container(
+                width=dur_px,
+                height=block_height,
+                padding=6,
+                border_radius=8,
+                bgcolor=ft.Colors.AMBER_600 if selected else color,
+                content=ft.Text(label, size=12, no_wrap=True),
+            )
 
         stack_children = [cont]
         if selected and clip.dur > 0:
@@ -1451,7 +2101,7 @@ def main(page: ft.Page) -> None:
 
         draggable = ft.Draggable(
             group="tl",
-            data={"kind": "clip", "track": track, "id": clip.id},
+            data={"kind": "clip", "track": track_id, "id": clip.id},
             axis=ft.Axis.HORIZONTAL,
             on_drag_start=lambda _e: _select_at(),
             content=clip_surface,
@@ -1460,13 +2110,27 @@ def main(page: ft.Page) -> None:
         return draggable
 
     def refresh_timeline() -> None:
-        v_row.controls.clear()
-        a_row.controls.clear()
+        timeline_tracks_col.controls.clear()
         v_start_sec_map.clear()
         v_start_px_map.clear()
         v_clip_width_px_map.clear()
 
-        def handle_drop(track: str, target_clip_id: Optional[str], payload: dict) -> None:
+        def _insert_existing_clip(before, target_id: str, moving_clip):
+            out = []
+            inserted = False
+            for c in before:
+                if c.id == target_id and not inserted:
+                    out.append(moving_clip)
+                    inserted = True
+                out.append(c)
+            if not inserted:
+                out.append(moving_clip)
+            return out
+
+        def handle_drop(track_id: str, target_clip_id: Optional[str], payload: dict) -> None:
+            track = _track_obj(track_id)
+            if track is None:
+                return
             kind = payload.get("kind")
             if kind == "media":
                 path = payload.get("path")
@@ -1474,63 +2138,86 @@ def main(page: ft.Page) -> None:
                 if not mi:
                     snack("ไม่พบ media")
                     return
-                if track == "v" and not mi.has_video:
-                    snack("No video stream (drop on A1 instead)")
+                if track.kind == "video" and not mi.has_video:
+                    snack(f"No video stream (drop on {state.project.primary_audio_track().name} instead)")
                     return
-                if track == "a" and not mi.has_audio:
+                if track.kind == "audio" and not mi.has_audio:
                     snack("No audio stream")
                     return
 
-                before = _track_clips(track)
+                before = _track_clips(track_id)
                 if target_clip_id:
-                    clips = insert_clip_before(before, target_clip_id, path, mi.duration)
+                    clips = insert_clip_before(before, target_clip_id, path, mi.duration, has_audio=mi.has_audio)
                 else:
-                    clips = add_clip_end(before, path, mi.duration)
+                    clips = add_clip_end(before, path, mi.duration, has_audio=mi.has_audio)
 
                 if clips != before:
-                    tr = "V1" if track == "v" else "A1"
-                    _history_record(f"Add {Path(path).name} to {tr}")
-                    _set_track_clips(track, clips)
+                    _history_record(f"Add {Path(path).name} to {track.name}")
+                    _set_track_clips(track_id, clips)
                     _mark_dirty()
             elif kind == "clip":
                 moving_id = payload.get("id")
                 moving_track = payload.get("track")
                 if not moving_id:
                     return
-                if moving_track != track:
+                src_track = _track_obj(str(moving_track or ""))
+                if src_track is None:
+                    return
+                if src_track.kind != track.kind:
+                    snack("Cannot move clip between video and audio tracks")
                     return
 
-                before = _track_clips(track)
-                if target_clip_id:
-                    clips = move_clip_before(before, moving_id, target_clip_id)
-                else:
-                    moving = None
-                    rest = []
-                    for c in before:
-                        if c.id == moving_id:
-                            moving = c
-                        else:
-                            rest.append(c)
-                    if moving is None:
-                        return
-                    clips = [*rest, moving]
+                src_before = _track_clips(src_track.id)
+                moving_clip = next((c for c in src_before if c.id == moving_id), None)
+                if moving_clip is None:
+                    return
 
-                if clips != before:
-                    m = _find_clip(track, moving_id)
-                    name = m.name if m else moving_id
-                    _history_record(f"Move {name}")
-                    _set_track_clips(track, clips)
-                    _mark_dirty()
+                if src_track.id == track_id:
+                    if target_clip_id:
+                        clips = move_clip_before(src_before, moving_id, target_clip_id)
+                    else:
+                        moving = None
+                        rest = []
+                        for c in src_before:
+                            if c.id == moving_id:
+                                moving = c
+                            else:
+                                rest.append(c)
+                        if moving is None:
+                            return
+                        clips = [*rest, moving]
+
+                    if clips != src_before:
+                        m = _find_clip(track_id, moving_id)
+                        name = m.name if m else moving_id
+                        _history_record(f"Move {name}")
+                        _set_track_clips(track_id, clips)
+                        _mark_dirty()
+                else:
+                    dst_before = _track_clips(track_id)
+                    src_after = [c for c in src_before if c.id != moving_id]
+                    dst_after = (
+                        _insert_existing_clip(dst_before, target_clip_id, moving_clip)
+                        if target_clip_id
+                        else [*dst_before, moving_clip]
+                    )
+                    if src_after != src_before or dst_after != dst_before:
+                        _history_record(f"Move {moving_clip.name} {src_track.name}->{track.name}")
+                        _set_track_clips(src_track.id, src_after)
+                        _set_track_clips(track_id, dst_after)
+                        state.selected_track = track_id
+                        state.selected_clip_id = moving_clip.id
+                        _mark_dirty()
             refresh_timeline()
 
         def _payload(e: ft.DragTargetEvent):
             return getattr(getattr(e, "src", None), "data", None)
 
-        def _end_drop(track: str, height: int) -> ft.DragTarget:
+        def _end_drop(track_id: str, height: int) -> ft.DragTarget:
             def on_drop_end(e: ft.DragTargetEvent) -> None:
                 payload = _payload(e)
                 if isinstance(payload, dict):
-                    handle_drop(track, None, payload)
+                    handle_drop(track_id, None, payload)
 
             return ft.DragTarget(
                 group="tl",
@@ -1546,75 +2233,155 @@ def main(page: ft.Page) -> None:
                 ),
             )
 
-        # V1 clips
+        primary_video_track_id = _timeline_video_track_id()
         v_time = 0.0
         v_px = 0.0
-        for c in state.project.v_clips:
-            def _make_on_accept_v(target_id: str):
-                def _on_accept(e: ft.DragTargetEvent) -> None:
-                    payload = _payload(e)
-                    if isinstance(payload, dict):
-                        handle_drop("v", target_id, payload)
-                return _on_accept
+        total_clip_count = 0
 
-            width = max(70, int(c.dur * state.px_per_sec))
-            block = clip_block("v", c.id)
-            drop_zone = ft.DragTarget(
-                group="tl",
-                on_accept=_make_on_accept_v(c.id),
-                content=ft.Container(
-                    width=16,
-                    height=40,
-                    bgcolor=ft.Colors.TRANSPARENT,
-                    border=ft.Border(left=ft.BorderSide(1, ft.Colors.WHITE12)),
+        for track in state.project.tracks:
+            row = ft.Row(spacing=6, scroll=ft.ScrollMode.AUTO)
+            total_clip_count += len(track.clips)
+
+            for c in track.clips:
+                def _make_on_accept(current_track_id: str, target_id: str):
+                    def _on_accept(e: ft.DragTargetEvent) -> None:
+                        payload = _payload(e)
+                        if isinstance(payload, dict):
+                            handle_drop(current_track_id, target_id, payload)
+                    return _on_accept
+
+                width = max(70, int(c.dur * state.px_per_sec))
+                block = clip_block(track.id, c.id)
+                drop_zone = ft.DragTarget(
+                    group="tl",
+                    on_accept=_make_on_accept(track.id, c.id),
+                    content=ft.Container(
+                        width=16,
+                        height=40 if track.kind == "video" else 34,
+                        bgcolor=ft.Colors.TRANSPARENT,
+                        border=ft.Border(left=ft.BorderSide(1, ft.Colors.WHITE12)),
+                    ),
+                )
+                row.controls.append(ft.Row(spacing=0, controls=[drop_zone, ft.Container(width=width, content=block)]))
+
+                if track.id == primary_video_track_id:
+                    v_start_sec_map[c.id] = v_time
+                    v_start_px_map[c.id] = v_px + 16  # clip starts after drop zone
+                    v_clip_width_px_map[c.id] = width
+                    v_time += c.dur
+                    v_px += 16 + width
+
+            row.controls.append(_end_drop(track.id, height=36 if track.kind == "video" else 28))
+
+            badge = "V" if track.kind == "video" else "A"
+            label = ft.Container(
+                width=timeline_lane_label_w,
+                padding=ft.padding.only(top=4, right=4),
+                content=ft.Column(
+                    [
+                        ft.Text(
+                            track.name,
+                            size=11,
+                            no_wrap=True,
+                            weight=ft.FontWeight.BOLD if state.selected_track == track.id else ft.FontWeight.W_500,
+                        ),
+                        ft.Text(
+                            f"{badge}{' M' if track.muted else ''}{' H' if not track.visible else ''}",
+                            size=10,
+                            color=ft.Colors.WHITE70,
+                        ),
+                    ],
+                    spacing=1,
+                    tight=True,
                 ),
             )
-            v_row.controls.append(ft.Row(spacing=0, controls=[drop_zone, ft.Container(width=width, content=block)]))
-            v_start_sec_map[c.id] = v_time
-            v_start_px_map[c.id] = v_px + 16  # clip starts after drop zone
-            v_clip_width_px_map[c.id] = width
-            v_time += c.dur
-            v_px += 16 + width
-
-        # A1 clips
-        for c in state.project.a_clips:
-            def _make_on_accept_a(target_id: str):
-                def _on_accept(e: ft.DragTargetEvent) -> None:
-                    payload = _payload(e)
-                    if isinstance(payload, dict):
-                        handle_drop("a", target_id, payload)
-                return _on_accept
-
-            width = max(70, int(c.dur * state.px_per_sec))
-            block = clip_block("a", c.id)
-            drop_zone = ft.DragTarget(
-                group="tl",
-                on_accept=_make_on_accept_a(c.id),
-                content=ft.Container(
-                    width=16,
-                    height=34,
-                    bgcolor=ft.Colors.TRANSPARENT,
-                    border=ft.Border(left=ft.BorderSide(1, ft.Colors.WHITE12)),
-                ),
+            timeline_tracks_col.controls.append(
+                ft.Row(
+                    [
+                        label,
+                        ft.Container(width=timeline_lane_gap_w),
+                        row,
+                    ],
+                    expand=True,
+                    spacing=0,
+                )
             )
-            a_row.controls.append(ft.Row(spacing=0, controls=[drop_zone, ft.Container(width=width, content=block)]))
 
-        v_row.controls.append(_end_drop("v", height=36))
-        a_row.controls.append(_end_drop("a", height=28))
-
-        v_total = _fmt_time(total_duration(state.project.v_clips))
-        a_total = _fmt_time(total_duration(state.project.a_clips))
-        timeline_info.value = f"V1: {len(state.project.v_clips)} clips | {v_total}   A1: {len(state.project.a_clips)} clips | {a_total}"
+        v_total = _fmt_time(total_duration(state.project.primary_video_track().clips))
+        a_total = _fmt_time(total_duration(state.project.primary_audio_track().clips))
+        timeline_info.value = (
+            f"Tracks V:{len(state.project.video_tracks)} A:{len(state.project.audio_tracks)} "
+            f"| Clips:{total_clip_count} | {state.project.primary_video_track().name}:{v_total} "
+            f"| {state.project.primary_audio_track().name}:{a_total}"
+        )
         nonlocal timeline_total_sec
-        timeline_total_sec = total_duration(state.project.v_clips)
+        timeline_total_sec = total_duration(state.project.primary_video_track().clips)
         update_playhead_ui()
         page.update()
+
+    def add_video_track_click(_e=None) -> None:
+        _history_record("Add video track")
+        t = state.project.add_track("video")
+        state.selected_track = t.id
+        state.selected_clip_id = None
+        _mark_dirty()
+        update_inspector()
+        refresh_timeline()
+
+    def add_audio_track_click(_e=None) -> None:
+        _history_record("Add audio track")
+        t = state.project.add_track("audio")
+        state.selected_track = t.id
+        state.selected_clip_id = None
+        _mark_dirty()
+        update_inspector()
+        refresh_timeline()
+
+    def remove_selected_track_click(_e=None) -> None:
+        track = _track_obj(state.selected_track)
+        if track is None:
+            snack("Select a track first")
+            return
+        if track.clips:
+            snack("Delete or move clips out first before removing this track")
+            return
+        _history_record(f"Remove track {track.name}")
+        ok = state.project.remove_track(track.id)
+        if not ok:
+            snack("Cannot remove the last track of this type")
+            return
+        state.selected_track = None
+        state.selected_clip_id = None
+        _mark_dirty()
+        update_inspector()
+        refresh_timeline()
+
+    def toggle_selected_track_mute_click(_e=None) -> None:
+        track = _track_obj(state.selected_track)
+        if track is None:
+            snack("Select a track first")
+            return
+        _history_record(f"{'Unmute' if track.muted else 'Mute'} track {track.name}")
+        track.muted = not bool(track.muted)
+        _mark_dirty()
+        refresh_timeline()
+
+    def toggle_selected_track_visible_click(_e=None) -> None:
+        track = _track_obj(state.selected_track)
+        if track is None:
+            snack("Select a track first")
+            return
+        _history_record(f"{'Show' if not track.visible else 'Hide'} track {track.name}")
+        track.visible = not bool(track.visible)
+        _mark_dirty()
+        refresh_timeline()
 
     # ---------- Actions ----------
     def import_click(_e):
         async def _pick() -> None:
             picked = await file_picker.pick_files(
                 allow_multiple=True,
+                initial_directory=_initial_project_dir(),
                 file_type=ft.FilePickerFileType.CUSTOM,
                 allowed_extensions=[
                     "mp4",
@@ -1761,6 +2528,7 @@ def main(page: ft.Page) -> None:
             save_project(state.project, path)
             state.project_path = path
             cfg.add_recent_project(path)
+            cfg.set_last_project_dir(path)
             _mark_saved()
             _refresh_recent_menu()
             snack(f"Saved: {Path(path).name}")
@@ -1773,6 +2541,7 @@ def main(page: ft.Page) -> None:
             default_name = Path(state.project_path).name if state.project_path else "project.json"
             out_path = await file_picker.save_file(
                 file_name=default_name,
+                initial_directory=_initial_project_dir(),
                 file_type=ft.FilePickerFileType.CUSTOM,
                 allowed_extensions=["json"],
             )
@@ -1782,6 +2551,7 @@ def main(page: ft.Page) -> None:
                 save_project(state.project, out_path)
                 state.project_path = out_path
                 cfg.add_recent_project(out_path)
+                cfg.set_last_project_dir(out_path)
                 _mark_saved()
                 _refresh_recent_menu()
                 snack(f"Saved: {Path(out_path).name}")
@@ -1795,6 +2565,7 @@ def main(page: ft.Page) -> None:
         async def _pick() -> None:
             picked = await file_picker.pick_files(
                 allow_multiple=False,
+                initial_directory=_initial_project_dir(),
                 file_type=ft.FilePickerFileType.CUSTOM,
                 allowed_extensions=["json"],
             )
@@ -1803,54 +2574,447 @@ def main(page: ft.Page) -> None:
             _open_project(picked[0].path)
 
         page.run_task(_pick)
+    def _open_export_settings_dialog(on_confirm) -> None:
+        presets = {
+            "social": ExportSettings(
+                width=1080,
+                height=1920,
+                video_codec="libx264",
+                crf=20,
+                audio_codec="aac",
+                audio_bitrate="192k",
+                format="mp4",
+                preset="medium",
+            ),
+            "yt1080": ExportSettings(
+                width=1920,
+                height=1080,
+                video_codec="libx264",
+                crf=20,
+                audio_codec="aac",
+                audio_bitrate="192k",
+                format="mp4",
+                preset="medium",
+            ),
+            "yt720": ExportSettings(
+                width=1280,
+                height=720,
+                video_codec="libx264",
+                crf=23,
+                audio_codec="aac",
+                audio_bitrate="160k",
+                format="mp4",
+                preset="medium",
+            ),
+            "draft": ExportSettings(
+                width=854,
+                height=480,
+                video_codec="libx264",
+                crf=28,
+                audio_codec="aac",
+                audio_bitrate="128k",
+                format="mp4",
+                preset="veryfast",
+            ),
+        }
+        working = ExportSettings.from_dict(state.export_settings.to_dict())
+
+        preset_dd = ft.Dropdown(
+            label="Preset",
+            width=200,
+            dense=True,
+            value="custom",
+            options=[
+                ft.dropdown.Option(key="custom", text="Custom"),
+                ft.dropdown.Option(key="social", text="Social (1080x1920)"),
+                ft.dropdown.Option(key="yt1080", text="YouTube 1080p"),
+                ft.dropdown.Option(key="yt720", text="YouTube 720p"),
+                ft.dropdown.Option(key="draft", text="Draft (fast)"),
+            ],
+        )
+        format_dd = ft.Dropdown(
+            label="Format",
+            width=130,
+            dense=True,
+            value=str(working.format or "mp4").lower(),
+            options=[
+                ft.dropdown.Option(key="mp4", text="MP4"),
+                ft.dropdown.Option(key="mov", text="MOV"),
+                ft.dropdown.Option(key="webm", text="WEBM"),
+            ],
+        )
+        width_tf = ft.TextField(
+            label="Width",
+            width=100,
+            dense=True,
+            value=str(int(working.width or 0)),
+            hint_text="0=keep",
+        )
+        height_tf = ft.TextField(
+            label="Height",
+            width=100,
+            dense=True,
+            value=str(int(working.height or 0)),
+            hint_text="0=keep",
+        )
+        video_codec_dd = ft.Dropdown(
+            label="Video codec",
+            width=170,
+            dense=True,
+            value=str(working.video_codec or "libx264").lower(),
+            options=[
+                ft.dropdown.Option(key="libx264", text="H.264 (libx264)"),
+                ft.dropdown.Option(key="libx265", text="HEVC (libx265)"),
+                ft.dropdown.Option(key="libvpx-vp9", text="VP9 (WEBM)"),
+            ],
+        )
+        audio_codec_dd = ft.Dropdown(
+            label="Audio codec",
+            width=140,
+            dense=True,
+            value=str(working.audio_codec or "aac").lower(),
+            options=[
+                ft.dropdown.Option(key="aac", text="AAC"),
+                ft.dropdown.Option(key="libopus", text="Opus"),
+            ],
+        )
+        bitrate_tf = ft.TextField(
+            label="Audio bitrate",
+            width=120,
+            dense=True,
+            value=str(working.audio_bitrate or "192k").lower(),
+            hint_text="e.g. 192k",
+        )
+        crf_value = ft.Text("", size=12, color=ft.Colors.WHITE70)
+        crf_slider = ft.Slider(
+            min=0,
+            max=51,
+            divisions=51,
+            value=float(max(0, min(51, int(working.crf if working.crf is not None else 23)))),
+        )
+        encode_preset_dd = ft.Dropdown(
+            label="Encode preset",
+            width=150,
+            dense=True,
+            value=str(working.preset or "medium").lower(),
+            options=[
+                ft.dropdown.Option(key="ultrafast", text="ultrafast"),
+                ft.dropdown.Option(key="superfast", text="superfast"),
+                ft.dropdown.Option(key="veryfast", text="veryfast"),
+                ft.dropdown.Option(key="faster", text="faster"),
+                ft.dropdown.Option(key="fast", text="fast"),
+                ft.dropdown.Option(key="medium", text="medium"),
+                ft.dropdown.Option(key="slow", text="slow"),
+                ft.dropdown.Option(key="slower", text="slower"),
+                ft.dropdown.Option(key="veryslow", text="veryslow"),
+            ],
+        )
+        settings_hint = ft.Text("0x0 keeps original resolution", size=11, color=ft.Colors.WHITE70)
+
+        def _update_crf_text() -> None:
+            try:
+                crf_value.value = f"CRF {int(round(float(crf_slider.value)))} (lower = better quality)"
+            except Exception:
+                crf_value.value = "CRF -"
+            crf_value.update()
+
+        def _sync_codec_controls() -> None:
+            fmt = str(format_dd.value or "mp4").strip().lower()
+            if fmt == "webm":
+                video_codec_dd.value = "libvpx-vp9"
+                audio_codec_dd.value = "libopus"
+                video_codec_dd.disabled = True
+                audio_codec_dd.disabled = True
+                if str(bitrate_tf.value or "").strip() == "":
+                    bitrate_tf.value = "160k"
+                settings_hint.value = "WEBM uses VP9 + Opus automatically"
+            else:
+                if str(video_codec_dd.value or "") == "libvpx-vp9":
+                    video_codec_dd.value = "libx264"
+                if str(audio_codec_dd.value or "") == "libopus":
+                    audio_codec_dd.value = "aac"
+                video_codec_dd.disabled = False
+                audio_codec_dd.disabled = False
+                settings_hint.value = "0x0 keeps original resolution"
+            try:
+                dialog.update()
+            except Exception:
+                pass
+
+        def _apply_settings_to_controls(s: ExportSettings) -> None:
+            width_tf.value = str(int(s.width or 0))
+            height_tf.value = str(int(s.height or 0))
+            format_dd.value = str(s.format or "mp4").lower()
+            video_codec_dd.value = str(s.video_codec or "libx264").lower()
+            audio_codec_dd.value = str(s.audio_codec or "aac").lower()
+            bitrate_tf.value = str(s.audio_bitrate or "192k").lower()
+            crf_slider.value = float(max(0, min(51, int(s.crf if s.crf is not None else 23))))
+            encode_preset_dd.value = str(s.preset or "medium").lower()
+            _update_crf_text()
+            _sync_codec_controls()
+            try:
+                dialog.update()
+            except Exception:
+                pass
+
+        def _parse_non_negative_int(raw: str, field: str) -> Optional[int]:
+            txt = str(raw or "").strip()
+            if txt == "":
+                return 0
+            try:
+                val = int(txt)
+            except Exception:
+                snack(f"{field} must be an integer")
+                return None
+            if val < 0:
+                snack(f"{field} must be >= 0")
+                return None
+            return val
+
+        def _collect_export_settings() -> Optional[ExportSettings]:
+            width = _parse_non_negative_int(width_tf.value, "Width")
+            height = _parse_non_negative_int(height_tf.value, "Height")
+            if width is None or height is None:
+                return None
+            if (width == 0) != (height == 0):
+                snack("Width and Height must both be 0, or both > 0")
+                return None
+            if width > 0 and (width < 16 or height < 16):
+                snack("Width/Height must be >= 16 when scaling is enabled")
+                return None
+
+            bitrate = str(bitrate_tf.value or "").strip().lower()
+            if not bitrate:
+                bitrate = "192k"
+            if len(bitrate) < 2 or bitrate[-1] not in ("k", "m") or (not bitrate[:-1].isdigit()):
+                snack("Audio bitrate must look like 192k or 1m")
+                return None
+
+            try:
+                crf = int(round(float(crf_slider.value)))
+            except Exception:
+                crf = 23
+
+            return ExportSettings(
+                width=width,
+                height=height,
+                video_codec=str(video_codec_dd.value or "libx264").strip().lower(),
+                crf=max(0, min(51, crf)),
+                audio_codec=str(audio_codec_dd.value or "aac").strip().lower(),
+                audio_bitrate=bitrate,
+                format=str(format_dd.value or "mp4").strip().lower(),
+                preset=str(encode_preset_dd.value or "medium").strip().lower(),
+            )
+
+        def _on_preset_change(_e: ft.ControlEvent) -> None:
+            key = str(preset_dd.value or "custom")
+            if key == "custom":
+                return
+            p = presets.get(key)
+            if p:
+                _apply_settings_to_controls(p)
+
+        def _on_format_change(_e: ft.ControlEvent) -> None:
+            preset_dd.value = "custom"
+            _sync_codec_controls()
+
+        def _on_crf_change(_e: ft.ControlEvent) -> None:
+            preset_dd.value = "custom"
+            _update_crf_text()
+
+        def _on_apply(_e: ft.ControlEvent) -> None:
+            settings = _collect_export_settings()
+            if settings is None:
+                return
+            state.export_settings = settings
+            try:
+                page.pop_dialog()
+            except Exception:
+                pass
+            on_confirm(settings)
+
+        def _on_cancel(_e: ft.ControlEvent) -> None:
+            try:
+                page.pop_dialog()
+            except Exception:
+                pass
+
+        preset_dd.on_change = _on_preset_change
+        format_dd.on_change = _on_format_change
+        crf_slider.on_change = _on_crf_change
+
+        dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Export Settings"),
+            content=ft.Column(
+                [
+                    ft.Row([preset_dd, ft.Container(expand=True), format_dd], wrap=True),
+                    ft.Row([width_tf, height_tf], spacing=8),
+                    ft.Row([video_codec_dd, audio_codec_dd, bitrate_tf], spacing=8, wrap=True),
+                    ft.Row([encode_preset_dd, ft.Container(expand=True), crf_value], wrap=True),
+                    crf_slider,
+                    settings_hint,
+                ],
+                spacing=8,
+                tight=True,
+                width=560,
+            ),
+            actions=[
+                ft.TextButton("Cancel", on_click=_on_cancel),
+                ft.FilledButton("Continue Export", icon=ft.Icons.OUTPUT, on_click=_on_apply),
+            ],
+        )
+        page.show_dialog(dialog)
+        _update_crf_text()
+        _sync_codec_controls()
 
     def export_click(_e):
-        if not state.project.v_clips:
-            snack("Timeline ว่าง")
+        nonlocal export_in_progress
+        if export_in_progress:
+            snack("Export is already running")
+            return
+        if not any(t.clips for t in state.project.video_tracks):
+            snack("Timeline is empty")
             return
 
-        async def _save_and_export() -> None:
-            out_path = await file_picker.save_file(
-                file_name="output.mp4",
-                file_type=ft.FilePickerFileType.CUSTOM,
-                allowed_extensions=["mp4"],
-            )
-            if not out_path:
-                return
+        def _run_export_with_settings(settings: ExportSettings) -> None:
+            async def _save_and_export() -> None:
+                nonlocal export_in_progress
+                fmt = str(settings.format or "mp4").strip().lower()
+                if fmt not in ("mp4", "mov", "webm"):
+                    fmt = "mp4"
 
-            bins = get_bins()
-            if not bins:
-                return
-            ffmpeg, ffprobe = bins
+                out_path = await file_picker.save_file(
+                    file_name=f"output.{fmt}",
+                    initial_directory=_initial_export_dir(),
+                    file_type=ft.FilePickerFileType.CUSTOM,
+                    allowed_extensions=[fmt],
+                )
+                if not out_path:
+                    return
+                out_path = str(Path(out_path).with_suffix(f".{fmt}"))
+                cfg.set_last_export_dir(out_path)
 
-            # Snapshot to keep export deterministic if the user keeps editing.
-            v_clips = list(state.project.v_clips)
-            a_clips = list(state.project.a_clips)
-            audio_mode = state.export_audio_mode
+                bins = get_bins()
+                if not bins:
+                    return
+                ffmpeg, ffprobe = bins
 
-            def _do_export() -> None:
-                try:
-                    export_project(
-                        ffmpeg,
-                        ffprobe,
-                        v_clips,
-                        a_clips,
-                        out_path,
-                        audio_mode=audio_mode,
-                    )
-                    msg = "Export เสร็จ"
-                except Exception as ex:
-                    log.exception("export failed: %s", ex)
-                    msg = f"Export ล้มเหลว: {ex}"
+                # Snapshot to keep export deterministic if the user keeps editing.
+                project_snapshot = Project.from_dict(state.project.to_dict())
+                v_clips = list(project_snapshot.v_clips)
+                a_clips = list(project_snapshot.a_clips)
+                tracks = list(project_snapshot.tracks)
+                audio_mode = state.export_audio_mode
+                export_settings = ExportSettings.from_dict(settings.to_dict())
+                video_tracks_with_clips = [t for t in project_snapshot.video_tracks if t.clips]
+                visible_video_tracks = [t for t in video_tracks_with_clips if t.visible]
+                progress_track = (
+                    visible_video_tracks[0]
+                    if visible_video_tracks
+                    else (video_tracks_with_clips[0] if video_tracks_with_clips else None)
+                )
+                total_sec = max(0.0, total_duration(progress_track.clips if progress_track else []))
 
-                async def _notify() -> None:
-                    snack(msg)
+                progress_label = ft.Text("Preparing export...", size=12)
+                progress_hint = ft.Text(
+                    f"{_fmt_time(0.0)} / {_fmt_time(total_sec)}",
+                    size=11,
+                    color=ft.Colors.WHITE70,
+                )
+                progress_bar = ft.ProgressBar(value=0.0, width=420)
+                export_dialog = ft.AlertDialog(
+                    modal=True,
+                    title=ft.Text("Exporting"),
+                    content=ft.Column(
+                        [
+                            progress_label,
+                            progress_bar,
+                            progress_hint,
+                        ],
+                        tight=True,
+                        spacing=8,
+                        width=460,
+                    ),
+                )
+                page.show_dialog(export_dialog)
+                page.update()
+                export_in_progress = True
 
-                page.run_task(_notify)
+                last_ui_emit = 0.0
+                last_ui_ratio = -1.0
+                progress_active = True
 
-            page.run_thread(_do_export)
+                def _schedule_progress_update(current_sec: float, total_sec_cb: float, force: bool = False) -> None:
+                    nonlocal last_ui_emit, last_ui_ratio, progress_active
+                    if not progress_active:
+                        return
+                    total_for_ui = max(total_sec, float(total_sec_cb or 0.0), 0.001)
+                    current_for_ui = max(0.0, min(total_for_ui, float(current_sec or 0.0)))
+                    ratio = max(0.0, min(1.0, current_for_ui / total_for_ui))
 
-        page.run_task(_save_and_export)
+                    now = time.perf_counter()
+                    if (not force) and ratio < 1.0:
+                        if now - last_ui_emit < 0.18 and (ratio - last_ui_ratio) < 0.01:
+                            return
+
+                    last_ui_emit = now
+                    last_ui_ratio = ratio
+                    pct = int(round(ratio * 100.0))
+
+                    async def _apply() -> None:
+                        if not progress_active:
+                            return
+                        progress_bar.value = ratio
+                        progress_label.value = f"Encoding... {pct}%"
+                        progress_hint.value = f"{_fmt_time(current_for_ui)} / {_fmt_time(total_for_ui)}"
+                        try:
+                            page.update()
+                        except Exception:
+                            pass
+
+                    page.run_task(_apply)
+
+                def _do_export() -> None:
+                    try:
+                        export_project_with_progress(
+                            ffmpeg,
+                            ffprobe,
+                            v_clips,
+                            a_clips,
+                            out_path,
+                            audio_mode=audio_mode,
+                            export_settings=export_settings,
+                            on_progress=lambda current, total: _schedule_progress_update(current, total),
+                            tracks=tracks,
+                        )
+                        ok = True
+                        err = ""
+                    except Exception as ex:
+                        log.exception("export failed: %s", ex)
+                        ok = False
+                        err = str(ex)
+
+                    async def _notify() -> None:
+                        nonlocal export_in_progress, progress_active
+                        export_in_progress = False
+                        progress_active = False
+                        try:
+                            page.pop_dialog()
+                        except Exception:
+                            pass
+                        if ok:
+                            snack(f"Export done: {Path(out_path).name}")
+                        else:
+                            snack(f"Export failed: {err}")
+
+                    page.run_task(_notify)
+
+                page.run_thread(_do_export)
+
+            page.run_task(_save_and_export)
+
+        _open_export_settings_dialog(_run_export_with_settings)
 
     def on_audio_mode_change(e: ft.ControlEvent) -> None:
         state.export_audio_mode = str(e.control.value)
@@ -1861,9 +3025,9 @@ def main(page: ft.Page) -> None:
         label="Export audio",
         value=state.export_audio_mode,
         options=[
-            ft.dropdown.Option(key="mix", text="Mix (V1 + A1)"),
-            ft.dropdown.Option(key="a1_only", text="A1 only (mute V1)"),
-            ft.dropdown.Option(key="v1_only", text="V1 only (ignore A1)"),
+            ft.dropdown.Option(key="mix", text="Mix all tracks"),
+            ft.dropdown.Option(key="a1_only", text="Primary A only"),
+            ft.dropdown.Option(key="v1_only", text="Primary V audio only"),
         ],
         on_select=on_audio_mode_change,
     )
@@ -1927,6 +3091,7 @@ def main(page: ft.Page) -> None:
                 split_label,
                 split_slider,
                 trim_row,
+                transition_panel,
                 audio_edit_panel,
                 audio_controls,
                 audio_pos,
@@ -1959,28 +3124,24 @@ def main(page: ft.Page) -> None:
         content=ft.Row([left_panel, ft.VerticalDivider(width=8), right_panel], expand=True),
     )
 
+    timeline_track_controls = ft.Row(
+        [
+            ft.OutlinedButton("Add V", icon=ft.Icons.VIDEO_COLLECTION, on_click=add_video_track_click),
+            ft.OutlinedButton("Add A", icon=ft.Icons.AUDIOTRACK, on_click=add_audio_track_click),
+            ft.OutlinedButton("Mute/Unmute", icon=ft.Icons.VOLUME_OFF, on_click=toggle_selected_track_mute_click),
+            ft.OutlinedButton("Show/Hide", icon=ft.Icons.VISIBILITY_OFF, on_click=toggle_selected_track_visible_click),
+            ft.TextButton("Remove Selected Track", icon=ft.Icons.DELETE_FOREVER, on_click=remove_selected_track_click),
+        ],
+        spacing=6,
+        wrap=False,
+    )
+
     timeline_content = ft.Column(
         [
             ft.Row([timeline_info, ft.Container(expand=True), ft.Text("Zoom"), timeline_zoom]),
+            timeline_track_controls,
             ft.Divider(height=6),
-            ft.Row(
-                [
-                    ft.Text("V1", width=timeline_lane_label_w),
-                    ft.Container(width=timeline_lane_gap_w),
-                    v_row,
-                ],
-                expand=True,
-                spacing=0,
-            ),
-            ft.Row(
-                [
-                    ft.Text("A1", width=timeline_lane_label_w),
-                    ft.Container(width=timeline_lane_gap_w),
-                    a_row,
-                ],
-                expand=True,
-                spacing=0,
-            ),
+            timeline_tracks_col,
         ],
         expand=True,
     )
@@ -2003,7 +3164,7 @@ def main(page: ft.Page) -> None:
 
     timeline = ft.Container(
         padding=10,
-        height=180,
+        height=250,
         border_radius=12,
         bgcolor=ft.Colors.BLUE_GREY_900,
         content=timeline_surface,
@@ -2028,9 +3189,10 @@ def main(page: ft.Page) -> None:
         if default_project and default_project.exists():
             _open_project(str(default_project))
             # Make split UX obvious: select the first clip if nothing is selected.
-            if state.project.v_clips and not state.selected_clip_id:
-                state.selected_track = "v"
-                state.selected_clip_id = state.project.v_clips[0].id
+            timeline_clips = _timeline_video_clips()
+            if timeline_clips and not state.selected_clip_id:
+                state.selected_track = _timeline_video_track_id()
+                state.selected_clip_id = timeline_clips[0].id
                 update_inspector()
                 refresh_timeline()
 
@@ -2164,18 +3326,28 @@ def main(page: ft.Page) -> None:
             await _shot("02_imported")
 
             # Add both files to V1 timeline.
+            timeline_track_id = _timeline_video_track_id()
             for src in demo_files:
                 mi = next((m for m in state.media if m.path == str(src)), None)
                 if not mi:
                     continue
-                state.project.v_clips = add_clip_end(state.project.v_clips, mi.path, mi.duration)
+                _set_track_clips(
+                    timeline_track_id,
+                    add_clip_end(
+                        _track_clips(timeline_track_id),
+                        mi.path,
+                        mi.duration,
+                        has_audio=mi.has_audio,
+                    ),
+                )
             _mark_dirty()
             refresh_timeline()
 
             # Select first clip for inspector visibility.
-            if state.project.v_clips:
-                state.selected_track = "v"
-                state.selected_clip_id = state.project.v_clips[0].id
+            timeline_clips = _timeline_video_clips()
+            if timeline_clips:
+                state.selected_track = _timeline_video_track_id()
+                state.selected_clip_id = timeline_clips[0].id
             update_inspector()
             await asyncio.sleep(0.6)
             await _shot("03_on_timeline")
@@ -2190,11 +3362,11 @@ def main(page: ft.Page) -> None:
 
             # Split each clip in half and keep the first half.
             for i, src in enumerate(demo_files, start=1):
-                clip = next((c for c in state.project.v_clips if c.src == str(src)), None)
+                clip = next((c for c in _timeline_video_clips() if c.src == str(src)), None)
                 if not clip:
                     continue
 
-                state.selected_track = "v"
+                state.selected_track = _timeline_video_track_id()
                 state.selected_clip_id = clip.id
                 update_inspector()
                 refresh_timeline()
@@ -2207,10 +3379,10 @@ def main(page: ft.Page) -> None:
                 await _shot(f"05_clip{i}_split")
 
                 # Delete the second half (the clip right after the selected first piece).
-                clips = state.project.v_clips
+                clips = _timeline_video_clips()
                 idx = next((k for k, c in enumerate(clips) if c.id == state.selected_clip_id), None)
                 if idx is not None and idx + 1 < len(clips):
-                    state.selected_track = "v"
+                    state.selected_track = _timeline_video_track_id()
                     state.selected_clip_id = clips[idx + 1].id
                     update_inspector()
                     delete_click(None)
@@ -2227,6 +3399,7 @@ def main(page: ft.Page) -> None:
                 out_file.parent.mkdir(parents=True, exist_ok=True)
             except Exception:
                 pass
+            cfg.set_last_export_dir(out_path)
 
             exporting = ft.AlertDialog(
                 modal=False,
@@ -2237,8 +3410,9 @@ def main(page: ft.Page) -> None:
             await asyncio.sleep(0.6)
             await _shot("07_exporting")
 
-            v_clips = list(state.project.v_clips)
-            a_clips = list(state.project.a_clips)
+            project_snapshot = Project.from_dict(state.project.to_dict())
+            v_clips = list(project_snapshot.v_clips)
+            a_clips = list(project_snapshot.a_clips)
             audio_mode = state.export_audio_mode
             try:
                 await asyncio.to_thread(
@@ -2249,6 +3423,8 @@ def main(page: ft.Page) -> None:
                     a_clips,
                     out_path,
                     audio_mode=audio_mode,
+                    export_settings=state.export_settings,
+                    tracks=list(project_snapshot.tracks),
                 )
                 ok = True
                 err = ""
@@ -2310,6 +3486,7 @@ def main(page: ft.Page) -> None:
             try:
                 save_project(state.project, path)
                 cfg.add_recent_project(path)
+                cfg.set_last_project_dir(path)
                 _mark_saved()
                 _refresh_recent_menu()
                 page.update()
@@ -2322,3 +3499,4 @@ def main(page: ft.Page) -> None:
 
 if __name__ == "__main__":
     ft.app(target=main)
+
