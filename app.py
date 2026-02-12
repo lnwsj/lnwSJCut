@@ -20,6 +20,27 @@ from core.ffmpeg import FFmpegNotFound, export_project, export_project_with_prog
 from core.history import HistoryEntry, HistoryManager
 from core.model import MAX_CLIP_SPEED, MIN_CLIP_SPEED, ExportSettings, Project, Transition, normalize_speed
 from core.project_io import load_project, save_project
+from core.shortcuts import (
+    ACTION_DELETE,
+    ACTION_DUPLICATE,
+    ACTION_EXPORT,
+    ACTION_IMPORT,
+    ACTION_RAZOR,
+    ACTION_REDO,
+    ACTION_SAVE,
+    ACTION_SELECT_NEXT,
+    ACTION_SELECT_PREV,
+    ACTION_SHOW_SHORTCUTS,
+    ACTION_SPLIT,
+    ACTION_TOGGLE_PLAY_PAUSE,
+    ACTION_TRIM_IN,
+    ACTION_TRIM_OUT,
+    ACTION_UNDO,
+    ACTION_ZOOM_IN,
+    ACTION_ZOOM_OUT,
+    resolve_shortcut_action,
+    shortcut_legend,
+)
 from core.thumbnails import generate_thumbnail, generate_waveform
 from core.timeline import (
     add_clip_end,
@@ -154,6 +175,7 @@ def main(page: ft.Page) -> None:
     timeline_visual_disabled: bool = False
     history = HistoryManager(limit=50)
     cfg = ConfigStore.default()
+    typing_shortcuts_blocked = False
     playhead_handle_w = 14.0
     playhead_bar = ft.Column(
         [
@@ -544,22 +566,27 @@ def main(page: ft.Page) -> None:
         _mark_dirty()
         snack(f"Redo: {entry.label}")
 
-    undo_btn = ft.IconButton(ft.Icons.UNDO, tooltip="Undo (Ctrl+Z)", on_click=undo_click, disabled=True)
-    redo_btn = ft.IconButton(ft.Icons.REDO, tooltip="Redo (Ctrl+Y)", on_click=redo_click, disabled=True)
+    undo_btn = ft.IconButton(ft.Icons.UNDO, tooltip="Undo (Ctrl/Cmd+Z)", on_click=undo_click, disabled=True)
+    redo_btn = ft.IconButton(ft.Icons.REDO, tooltip="Redo (Ctrl/Cmd+Y)", on_click=redo_click, disabled=True)
+    shortcuts_btn = ft.IconButton(
+        ft.Icons.KEYBOARD,
+        tooltip="Keyboard shortcuts (F1 / ?)",
+        on_click=lambda _e: _show_shortcuts_dialog(),
+    )
 
     def _refresh_history_controls() -> None:
         undo_btn.disabled = not history.can_undo()
         redo_btn.disabled = not history.can_redo()
 
         if history.can_undo():
-            undo_btn.tooltip = f"Undo: {history.peek_undo_label()} (Ctrl+Z)"
+            undo_btn.tooltip = f"Undo: {history.peek_undo_label()} (Ctrl/Cmd+Z)"
         else:
-            undo_btn.tooltip = "Undo (Ctrl+Z)"
+            undo_btn.tooltip = "Undo (Ctrl/Cmd+Z)"
 
         if history.can_redo():
-            redo_btn.tooltip = f"Redo: {history.peek_redo_label()} (Ctrl+Y)"
+            redo_btn.tooltip = f"Redo: {history.peek_redo_label()} (Ctrl/Cmd+Y)"
         else:
-            redo_btn.tooltip = "Redo (Ctrl+Y)"
+            redo_btn.tooltip = "Redo (Ctrl/Cmd+Y)"
 
     def _select_neighbor(delta: int) -> None:
         selected_track = _track_obj(state.selected_track)
@@ -590,51 +617,95 @@ def main(page: ft.Page) -> None:
         update_inspector()
         refresh_timeline()
 
-    def on_keyboard(e: ft.KeyboardEvent) -> None:
-        key = (getattr(e, "key", "") or "").lower()
-        ctrl = bool(getattr(e, "ctrl", False))
-        shift = bool(getattr(e, "shift", False))
-        alt = bool(getattr(e, "alt", False))
-        meta = bool(getattr(e, "meta", False))
+    def _show_shortcuts_dialog(_e=None) -> None:
+        rows = []
+        for keys, desc in shortcut_legend():
+            rows.append(
+                ft.Row(
+                    [
+                        ft.Container(width=210, content=ft.Text(keys, weight=ft.FontWeight.BOLD, size=12)),
+                        ft.Text(desc, size=12, color=ft.Colors.WHITE70),
+                    ],
+                    alignment=ft.MainAxisAlignment.START,
+                    vertical_alignment=ft.CrossAxisAlignment.START,
+                )
+            )
 
-        if ctrl and not shift and key == "z":
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Keyboard Shortcuts"),
+            content=ft.Container(
+                width=560,
+                height=360,
+                content=ft.ListView(rows, spacing=6),
+            ),
+            actions=[ft.TextButton("Close", on_click=lambda _e: page.pop_dialog())],
+        )
+        page.show_dialog(dlg)
+
+    def on_keyboard(e: ft.KeyboardEvent) -> None:
+        ev_type = str(getattr(e, "type", "") or "").strip().lower().replace("_", "")
+        if ev_type and ev_type != "keydown":
+            return
+
+        action = resolve_shortcut_action(
+            key=str(getattr(e, "key", "") or ""),
+            ctrl=bool(getattr(e, "ctrl", False)),
+            shift=bool(getattr(e, "shift", False)),
+            alt=bool(getattr(e, "alt", False)),
+            meta=bool(getattr(e, "meta", False)),
+            typing_focus=bool(typing_shortcuts_blocked),
+        )
+        if not action:
+            return
+
+        if action == ACTION_UNDO:
             undo_click()
-        elif ctrl and (key == "y" or (shift and key == "z")):
+        elif action == ACTION_REDO:
             redo_click()
-        elif (key == "delete" or key == "backspace") and not (ctrl or alt or meta):
+        elif action == ACTION_DELETE:
             delete_click(None)
-        elif ctrl and key == "s":
+        elif action == ACTION_SAVE:
             save_click(None)
-        elif not ctrl and key == "s":
+        elif action == ACTION_SPLIT:
             split_click(None)
-        elif not ctrl and key == "r":
+        elif action == ACTION_RAZOR:
             razor_multi_cut_click(None)
-        elif not ctrl and key == "i":
+        elif action == ACTION_TRIM_IN:
             trim_set_in_click(None)
-        elif not ctrl and key == "o":
+        elif action == ACTION_TRIM_OUT:
             trim_set_out_click(None)
-        elif ctrl and key == "e":
+        elif action == ACTION_EXPORT:
             export_click(None)
-        elif ctrl and key == "i":
+        elif action == ACTION_IMPORT:
             import_click(None)
-        elif ctrl and key == "d":
+        elif action == ACTION_DUPLICATE:
             duplicate_click(None)
-        elif key in ("+", "=", "add"):
+        elif action == ACTION_ZOOM_IN:
             try:
                 timeline_zoom.value = min(180, float(timeline_zoom.value) + 10)
                 on_zoom(None)
             except Exception:
                 pass
-        elif key in ("-", "_", "subtract"):
+        elif action == ACTION_ZOOM_OUT:
             try:
                 timeline_zoom.value = max(20, float(timeline_zoom.value) - 10)
                 on_zoom(None)
             except Exception:
                 pass
-        elif key in ("arrow left", "left", "arrowleft"):
+        elif action == ACTION_SELECT_PREV:
             _select_neighbor(-1)
-        elif key in ("arrow right", "right", "arrowright"):
+        elif action == ACTION_SELECT_NEXT:
             _select_neighbor(1)
+        elif action == ACTION_TOGGLE_PLAY_PAUSE:
+            if state.is_playing:
+                pause_click(None)
+            elif _is_selected_audio():
+                _play_audio(from_split=False)
+            else:
+                play_click(None)
+        elif action == ACTION_SHOW_SHORTCUTS:
+            _show_shortcuts_dialog()
 
     page.on_keyboard_event = on_keyboard
     _refresh_history_controls()
@@ -880,6 +951,19 @@ def main(page: ft.Page) -> None:
     trim_in = ft.TextField(label="In", width=110, dense=True, hint_text="mm:ss")
     trim_out = ft.TextField(label="Out", width=110, dense=True, hint_text="mm:ss")
     trim_hint = ft.Text("", size=11, color=ft.Colors.WHITE70)
+
+    def _text_input_focus_on(_e: ft.ControlEvent) -> None:
+        nonlocal typing_shortcuts_blocked
+        typing_shortcuts_blocked = True
+
+    def _text_input_focus_off(_e: ft.ControlEvent) -> None:
+        nonlocal typing_shortcuts_blocked
+        typing_shortcuts_blocked = False
+
+    trim_in.on_focus = _text_input_focus_on
+    trim_in.on_blur = _text_input_focus_off
+    trim_out.on_focus = _text_input_focus_on
+    trim_out.on_blur = _text_input_focus_off
 
     def _selected_source_duration(clip) -> Optional[float]:
         mi = next((m for m in state.media if m.path == clip.src), None)
@@ -3457,6 +3541,7 @@ def main(page: ft.Page) -> None:
             ft.ElevatedButton("Import", icon=ft.Icons.UPLOAD_FILE, on_click=import_click),
             undo_btn,
             redo_btn,
+            shortcuts_btn,
             ft.ElevatedButton("Split", icon=ft.Icons.CONTENT_CUT, on_click=split_click),
             ft.OutlinedButton(
                 "Razor",
@@ -3521,7 +3606,7 @@ def main(page: ft.Page) -> None:
                 audio_edit_panel,
                 audio_controls,
                 audio_pos,
-                ft.Text("Tip: Split (S) | Razor all tracks (R)", size=12, color=ft.Colors.WHITE70),
+                ft.Text("Tip: Split (S) | Razor all tracks (R) | Shortcuts (F1)", size=12, color=ft.Colors.WHITE70),
             ],
             spacing=6,
             expand=True,
