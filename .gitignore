@@ -24,6 +24,12 @@ project.json
 run_stdout*.txt
 run_stderr*.txt
 
+# Local caches / generated assets
+.cache/
+assets/_preview_cache/
+assets/_timeline_cache_*/
+output/
+
 # Media files (usually large; keep out of git)
 *.mp4
 *.mov
