@@ -173,6 +173,31 @@ class TestFFmpegNoAudio(unittest.TestCase):
         self.assertIn("-movflags +faststart", joined)
 
     @patch("core.ffmpeg.probe_media")
+    def test_build_export_command_project_normalizes_odd_resolution_to_even(self, probe_media):
+        probe_media.return_value = MediaInfo(duration=10.0, has_video=True, has_audio=True)
+        settings = ExportSettings(
+            width=853,
+            height=479,
+            video_codec="libx264",
+            crf=23,
+            audio_codec="aac",
+            audio_bitrate="192k",
+            format="mp4",
+            preset="medium",
+        )
+        cmd = build_export_command_project(
+            "ffmpeg",
+            "ffprobe",
+            [Clip(id="v1", src="v.mp4", in_sec=0.0, out_sec=2.0)],
+            [],
+            "out.mp4",
+            export_settings=settings,
+        )
+        joined = " ".join(cmd)
+        self.assertIn("scale=w=852:h=478:force_original_aspect_ratio=decrease", joined)
+        self.assertIn("pad=852:478:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1[v]", joined)
+
+    @patch("core.ffmpeg.probe_media")
     def test_build_export_command_project_webm_forces_vp9_opus(self, probe_media):
         probe_media.return_value = MediaInfo(duration=10.0, has_video=True, has_audio=True)
         settings = ExportSettings(

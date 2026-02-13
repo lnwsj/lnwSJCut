@@ -3239,11 +3239,32 @@ def main(page: ft.Page) -> None:
         }
         working = ExportSettings.from_dict(state.export_settings.to_dict())
 
+        def _settings_fingerprint(s: ExportSettings) -> tuple:
+            return (
+                int(s.width or 0),
+                int(s.height or 0),
+                str(s.video_codec or "libx264").strip().lower(),
+                int(s.crf if s.crf is not None else 23),
+                str(s.audio_codec or "aac").strip().lower(),
+                str(s.audio_bitrate or "192k").strip().lower(),
+                str(s.format or "mp4").strip().lower(),
+                str(s.preset or "medium").strip().lower(),
+            )
+
+        def _detect_preset_key(s: ExportSettings) -> str:
+            fp = _settings_fingerprint(s)
+            for key, val in presets.items():
+                if _settings_fingerprint(val) == fp:
+                    return key
+            return "custom"
+
+        preset_sync_lock = False
+
         preset_dd = ft.Dropdown(
             label="Preset",
             width=200,
             dense=True,
-            value="custom",
+            value=_detect_preset_key(working),
             options=[
                 ft.dropdown.Option(key="custom", text="Custom"),
                 ft.dropdown.Option(key="social", text="Social (1080x1920)"),
@@ -3330,6 +3351,17 @@ def main(page: ft.Page) -> None:
             ],
         )
         settings_hint = ft.Text("0x0 keeps original resolution", size=11, color=ft.Colors.WHITE70)
+        settings_preview = ft.Text("", size=11, color=ft.Colors.WHITE70)
+
+        def _set_preset_custom() -> None:
+            nonlocal preset_sync_lock
+            if preset_sync_lock:
+                return
+            preset_sync_lock = True
+            try:
+                preset_dd.value = "custom"
+            finally:
+                preset_sync_lock = False
 
         def _update_crf_text() -> None:
             try:
@@ -3337,6 +3369,34 @@ def main(page: ft.Page) -> None:
             except Exception:
                 crf_value.value = "CRF -"
             crf_value.update()
+
+        def _update_settings_preview() -> None:
+            fmt = str(format_dd.value or "mp4").strip().lower()
+            try:
+                w = int(str(width_tf.value or "0").strip() or "0")
+                h = int(str(height_tf.value or "0").strip() or "0")
+            except Exception:
+                w = 0
+                h = 0
+            if w > 0 and h > 0:
+                res = f"{w}x{h}"
+            else:
+                res = "source"
+            vcodec = str(video_codec_dd.value or "libx264").strip().lower()
+            acodec = str(audio_codec_dd.value or "aac").strip().lower()
+            ab = str(bitrate_tf.value or "192k").strip().lower() or "192k"
+            try:
+                crf_now = int(round(float(crf_slider.value)))
+            except Exception:
+                crf_now = 23
+            ep = str(encode_preset_dd.value or "medium").strip().lower()
+            settings_preview.value = (
+                f"Output: {fmt.upper()} | Res: {res} | V: {vcodec} CRF {crf_now} {ep} | A: {acodec} {ab}"
+            )
+            try:
+                settings_preview.update()
+            except Exception:
+                pass
 
         def _sync_codec_controls() -> None:
             fmt = str(format_dd.value or "mp4").strip().lower()
@@ -3356,22 +3416,30 @@ def main(page: ft.Page) -> None:
                 video_codec_dd.disabled = False
                 audio_codec_dd.disabled = False
                 settings_hint.value = "0x0 keeps original resolution"
+            _update_settings_preview()
             try:
                 dialog.update()
             except Exception:
                 pass
 
         def _apply_settings_to_controls(s: ExportSettings) -> None:
-            width_tf.value = str(int(s.width or 0))
-            height_tf.value = str(int(s.height or 0))
-            format_dd.value = str(s.format or "mp4").lower()
-            video_codec_dd.value = str(s.video_codec or "libx264").lower()
-            audio_codec_dd.value = str(s.audio_codec or "aac").lower()
-            bitrate_tf.value = str(s.audio_bitrate or "192k").lower()
-            crf_slider.value = float(max(0, min(51, int(s.crf if s.crf is not None else 23))))
-            encode_preset_dd.value = str(s.preset or "medium").lower()
-            _update_crf_text()
-            _sync_codec_controls()
+            nonlocal preset_sync_lock
+            preset_sync_lock = True
+            try:
+                width_tf.value = str(int(s.width or 0))
+                height_tf.value = str(int(s.height or 0))
+                format_dd.value = str(s.format or "mp4").lower()
+                video_codec_dd.value = str(s.video_codec or "libx264").lower()
+                audio_codec_dd.value = str(s.audio_codec or "aac").lower()
+                bitrate_tf.value = str(s.audio_bitrate or "192k").lower()
+                crf_slider.value = float(max(0, min(51, int(s.crf if s.crf is not None else 23))))
+                encode_preset_dd.value = str(s.preset or "medium").lower()
+                preset_dd.value = _detect_preset_key(s)
+                _update_crf_text()
+                _update_settings_preview()
+                _sync_codec_controls()
+            finally:
+                preset_sync_lock = False
             try:
                 dialog.update()
             except Exception:
@@ -3402,6 +3470,9 @@ def main(page: ft.Page) -> None:
             if width > 0 and (width < 16 or height < 16):
                 snack("Width/Height must be >= 16 when scaling is enabled")
                 return None
+            if width > 0 and ((width % 2) != 0 or (height % 2) != 0):
+                snack("Width/Height must be even numbers (e.g. 1920x1080)")
+                return None
 
             bitrate = str(bitrate_tf.value or "").strip().lower()
             if not bitrate:
@@ -3427,6 +3498,8 @@ def main(page: ft.Page) -> None:
             )
 
         def _on_preset_change(_e: ft.ControlEvent) -> None:
+            if preset_sync_lock:
+                return
             key = str(preset_dd.value or "custom")
             if key == "custom":
                 return
@@ -3435,12 +3508,17 @@ def main(page: ft.Page) -> None:
                 _apply_settings_to_controls(p)
 
         def _on_format_change(_e: ft.ControlEvent) -> None:
-            preset_dd.value = "custom"
+            _set_preset_custom()
             _sync_codec_controls()
 
         def _on_crf_change(_e: ft.ControlEvent) -> None:
-            preset_dd.value = "custom"
+            _set_preset_custom()
             _update_crf_text()
+            _update_settings_preview()
+
+        def _on_manual_control_change(_e: ft.ControlEvent) -> None:
+            _set_preset_custom()
+            _update_settings_preview()
 
         def _on_apply(_e: ft.ControlEvent) -> None:
             settings = _collect_export_settings()
@@ -3462,6 +3540,12 @@ def main(page: ft.Page) -> None:
         preset_dd.on_change = _on_preset_change
         format_dd.on_change = _on_format_change
         crf_slider.on_change = _on_crf_change
+        width_tf.on_change = _on_manual_control_change
+        height_tf.on_change = _on_manual_control_change
+        video_codec_dd.on_change = _on_manual_control_change
+        audio_codec_dd.on_change = _on_manual_control_change
+        bitrate_tf.on_change = _on_manual_control_change
+        encode_preset_dd.on_change = _on_manual_control_change
 
         dialog = ft.AlertDialog(
             modal=True,
@@ -3474,6 +3558,7 @@ def main(page: ft.Page) -> None:
                     ft.Row([encode_preset_dd, ft.Container(expand=True), crf_value], wrap=True),
                     crf_slider,
                     settings_hint,
+                    settings_preview,
                 ],
                 spacing=8,
                 tight=True,
@@ -3487,6 +3572,7 @@ def main(page: ft.Page) -> None:
         page.show_dialog(dialog)
         _update_crf_text()
         _sync_codec_controls()
+        _update_settings_preview()
 
     def export_click(_e):
         nonlocal export_in_progress

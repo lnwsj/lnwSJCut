@@ -335,6 +335,14 @@ def _normalize_export_settings(export_settings: Optional[ExportSettings]) -> Exp
     if width <= 0 or height <= 0:
         width = 0
         height = 0
+    else:
+        # yuv420p encoders are safest with even dimensions.
+        width = max(16, width)
+        height = max(16, height)
+        if (width % 2) != 0:
+            width -= 1
+        if (height % 2) != 0:
+            height -= 1
 
     try:
         crf = max(0, min(51, int(raw.crf if raw.crf is not None else 23)))
