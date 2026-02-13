@@ -222,8 +222,10 @@ def main(page: ft.Page) -> None:
     timeline_total_sec: float = 0.0
     export_in_progress: bool = False
 
-    # Default project path keeps existing behavior (single project.json in repo root).
-    state.project_path = str(root / "project.json")
+    # Project path starts unset unless there's an existing default project.json.
+    # This avoids writing into the app folder when running as a packaged executable.
+    default_project_path = root / "project.json"
+    state.project_path = str(default_project_path) if default_project_path.exists() else None
 
     # ---------- helpers ----------
     def snack(msg: str) -> None:
@@ -796,6 +798,7 @@ def main(page: ft.Page) -> None:
         page.update()
 
     file_picker = ft.FilePicker()
+    page.overlay.append(file_picker)
 
     recent_menu = ft.PopupMenuButton(icon=ft.Icons.HISTORY, tooltip="Recent projects", items=[])
 
@@ -871,6 +874,28 @@ def main(page: ft.Page) -> None:
     # Best-effort: Flet desktop supports dropping files from OS.
     page.on_drop = on_file_drop
 
+    def _project_source_paths(project: Project) -> List[str]:
+        seen = set()
+        out: List[str] = []
+        for t in getattr(project, "tracks", []) or []:
+            for c in getattr(t, "clips", []) or []:
+                src = str(getattr(c, "src", "") or "").strip()
+                if not src:
+                    continue
+                key = src.lower() if os.name == "nt" else src
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(src)
+        return out
+
+    def _try_resolve_ffprobe_quiet() -> Optional[str]:
+        try:
+            _ffmpeg, ffprobe = resolve_ffmpeg_bins(root)
+            return ffprobe
+        except Exception:
+            return None
+
     def _open_project(path: str) -> None:
         raw_path = str(path or "").strip()
         if not raw_path:
@@ -892,6 +917,54 @@ def main(page: ft.Page) -> None:
 
             history.clear()
             _refresh_history_controls()
+
+            # Rebuild Media Bin from project clip sources (best-effort, async).
+            state.media.clear()
+            refresh_media()
+            sources = _project_source_paths(state.project)
+            ffprobe_path = _try_resolve_ffprobe_quiet()
+
+            if sources and ffprobe_path:
+                async def _probe_sources() -> None:
+                    added = 0
+                    missing = 0
+                    for src in sources:
+                        p = Path(src)
+                        if not p.exists():
+                            missing += 1
+                            continue
+                        try:
+                            info = await asyncio.to_thread(probe_media, ffprobe_path, src)
+                            if info.duration <= 0.01:
+                                continue
+                            state.media.append(
+                                MediaItem(
+                                    path=src,
+                                    duration=info.duration,
+                                    has_video=info.has_video,
+                                    has_audio=info.has_audio,
+                                    width=info.width,
+                                    height=info.height,
+                                    fps=info.fps,
+                                    video_codec=info.video_codec,
+                                    audio_codec=info.audio_codec,
+                                    video_bitrate=info.video_bitrate,
+                                    audio_bitrate=info.audio_bitrate,
+                                    file_size_bytes=info.file_size_bytes,
+                                    pixel_format=info.pixel_format,
+                                    sample_rate=info.sample_rate,
+                                    channels=info.channels,
+                                )
+                            )
+                            added += 1
+                        except Exception:
+                            missing += 1
+                    if added:
+                        refresh_media()
+                    if missing:
+                        snack(f"Some media files could not be loaded ({missing})")
+
+                page.run_task(_probe_sources)
 
             cfg.add_recent_project(opened_path)
             cfg.set_last_project_dir(opened_path)
@@ -3144,9 +3217,11 @@ def main(page: ft.Page) -> None:
 
     def save_click(_e):
         try:
-            path = state.project_path or str(root / "project.json")
+            if not state.project_path:
+                save_as_click(_e)
+                return
+            path = state.project_path
             save_project(state.project, path)
-            state.project_path = path
             cfg.add_recent_project(path)
             cfg.set_last_project_dir(path)
             _mark_saved()
@@ -3942,15 +4017,21 @@ def main(page: ft.Page) -> None:
     refresh_timeline()
     update_inspector()
 
-    # Convenience: auto-open the default project file on startup.
+    # Convenience: auto-open the most recent project file on startup.
     # Skip in system-test mode to keep tests deterministic.
-    if not system_test_enabled and state.project_path:
-        try:
-            default_project = Path(state.project_path)
-        except Exception:
-            default_project = None
-        if default_project and default_project.exists():
-            _open_project(str(default_project))
+    if not system_test_enabled:
+        auto_open_path: Optional[str] = None
+        for rp in cfg.recent_projects(limit=10):
+            try:
+                if Path(rp.path).exists():
+                    auto_open_path = rp.path
+                    break
+            except Exception:
+                continue
+        if not auto_open_path and state.project_path:
+            auto_open_path = state.project_path
+        if auto_open_path:
+            _open_project(auto_open_path)
             # Make split UX obvious: select the first clip if nothing is selected.
             timeline_clips = _timeline_video_clips()
             if timeline_clips and not state.selected_clip_id:

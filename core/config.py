@@ -71,6 +71,7 @@ class ConfigStore:
         return {
             "recent": [],
             "auto_save_interval_sec": 60,
+            "last_project_dir": "",
             "last_export_dir": "",
         }
 
@@ -102,6 +103,25 @@ class ConfigStore:
         cfg["recent"] = []
         self.save(cfg)
 
+    def remove_recent_project(self, path: str) -> None:
+        p = str(path).strip()
+        if not p:
+            return
+        try:
+            p = str(Path(p).resolve())
+        except Exception:
+            pass
+        key = p.lower() if os.name == "nt" else p
+
+        cfg = self.load()
+        kept: List[RecentProject] = []
+        for rp in self.recent_projects(limit=50):
+            rp_key = rp.path.lower() if os.name == "nt" else rp.path
+            if rp_key != key:
+                kept.append(rp)
+        cfg["recent"] = [x.to_dict() for x in kept[:10]]
+        self.save(cfg)
+
     def add_recent_project(self, path: str, name: Optional[str] = None) -> None:
         p = str(path).strip()
         if not p:
@@ -129,3 +149,41 @@ class ConfigStore:
         cfg["recent"] = [x.to_dict() for x in recent]
         self.save(cfg)
 
+    def _normalize_directory(self, value: str) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+        try:
+            p = Path(raw)
+            if p.suffix:
+                p = p.parent
+            p = p.resolve()
+            if p.exists() and p.is_dir():
+                return str(p)
+        except Exception:
+            return ""
+        return ""
+
+    def last_project_dir(self) -> str:
+        cfg = self.load()
+        return self._normalize_directory(str(cfg.get("last_project_dir", "")))
+
+    def set_last_project_dir(self, path_or_dir: str) -> None:
+        normalized = self._normalize_directory(str(path_or_dir or ""))
+        if not normalized:
+            return
+        cfg = self.load()
+        cfg["last_project_dir"] = normalized
+        self.save(cfg)
+
+    def last_export_dir(self) -> str:
+        cfg = self.load()
+        return self._normalize_directory(str(cfg.get("last_export_dir", "")))
+
+    def set_last_export_dir(self, path_or_dir: str) -> None:
+        normalized = self._normalize_directory(str(path_or_dir or ""))
+        if not normalized:
+            return
+        cfg = self.load()
+        cfg["last_export_dir"] = normalized
+        self.save(cfg)
