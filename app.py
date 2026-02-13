@@ -345,6 +345,11 @@ def main(page: ft.Page) -> None:
         return state.project.primary_audio_track().id
 
     def _timeline_video_track():
+        # Prefer the currently selected visible video track for playhead/preview so
+        # editing multiple video layers feels consistent.
+        sel = _track_obj(state.selected_track)
+        if sel is not None and sel.kind == "video" and sel.visible and sel.clips:
+            return sel
         for t in state.project.video_tracks:
             if t.visible and t.clips:
                 return t
@@ -2831,7 +2836,17 @@ def main(page: ft.Page) -> None:
         v_px = 0.0
         total_clip_count = 0
 
-        for track in state.project.tracks:
+        tracks_to_render = [*state.project.video_tracks, *state.project.audio_tracks]
+
+        def _select_track_only(track_id: str) -> None:
+            if state.selected_track == track_id and state.selected_clip_id is None:
+                return
+            state.selected_track = track_id
+            state.selected_clip_id = None
+            update_inspector()
+            refresh_timeline()
+
+        for track in tracks_to_render:
             row = ft.Row(spacing=6, scroll=ft.ScrollMode.AUTO)
             total_clip_count += len(track.clips)
 
@@ -2867,7 +2882,7 @@ def main(page: ft.Page) -> None:
             row.controls.append(_end_drop(track.id, height=36 if track.kind == "video" else 28))
 
             badge = "V" if track.kind == "video" else "A"
-            label = ft.Container(
+            label_body = ft.Container(
                 width=timeline_lane_label_w,
                 padding=ft.padding.only(top=4, right=4),
                 content=ft.Column(
@@ -2877,16 +2892,22 @@ def main(page: ft.Page) -> None:
                             size=11,
                             no_wrap=True,
                             weight=ft.FontWeight.BOLD if state.selected_track == track.id else ft.FontWeight.W_500,
+                            color=ft.Colors.WHITE if track.visible else ft.Colors.WHITE54,
                         ),
                         ft.Text(
                             f"{badge}{' M' if track.muted else ''}{' H' if not track.visible else ''}",
                             size=10,
-                            color=ft.Colors.WHITE70,
+                            color=ft.Colors.WHITE70 if track.visible else ft.Colors.WHITE38,
                         ),
                     ],
                     spacing=1,
                     tight=True,
                 ),
+            )
+            label = ft.GestureDetector(
+                mouse_cursor=ft.MouseCursor.CLICK,
+                on_tap_down=lambda _e, tid=track.id: _select_track_only(tid),
+                content=label_body,
             )
             timeline_tracks_col.controls.append(
                 ft.Row(
@@ -2980,6 +3001,10 @@ def main(page: ft.Page) -> None:
         if track.clips:
             snack("Delete or move clips out first before removing this track")
             return
+        same_kind = state.project.video_tracks if track.kind == "video" else state.project.audio_tracks
+        if len(same_kind) <= 1:
+            snack("Cannot remove the last track of this type")
+            return
         _history_record(f"Remove track {track.name}")
         ok = state.project.remove_track(track.id)
         if not ok:
@@ -3010,6 +3035,99 @@ def main(page: ft.Page) -> None:
         track.visible = not bool(track.visible)
         _mark_dirty()
         refresh_timeline()
+
+    def move_selected_track_up_click(_e=None) -> None:
+        track = _track_obj(state.selected_track)
+        if track is None:
+            snack("Select a track first")
+            return
+        group = state.project.video_tracks if track.kind == "video" else state.project.audio_tracks
+        ids = [t.id for t in group]
+        if track.id not in ids:
+            return
+        idx = ids.index(track.id)
+        if idx <= 0:
+            snack("Track is already at the top")
+            return
+        _history_record(f"Move track up: {track.name}")
+        state.project.move_track(track.id, -1)
+        _mark_dirty()
+        refresh_timeline()
+
+    def move_selected_track_down_click(_e=None) -> None:
+        track = _track_obj(state.selected_track)
+        if track is None:
+            snack("Select a track first")
+            return
+        group = state.project.video_tracks if track.kind == "video" else state.project.audio_tracks
+        ids = [t.id for t in group]
+        if track.id not in ids:
+            return
+        idx = ids.index(track.id)
+        if idx >= len(ids) - 1:
+            snack("Track is already at the bottom")
+            return
+        _history_record(f"Move track down: {track.name}")
+        state.project.move_track(track.id, 1)
+        _mark_dirty()
+        refresh_timeline()
+
+    def rename_selected_track_click(_e=None) -> None:
+        track = _track_obj(state.selected_track)
+        if track is None:
+            snack("Select a track first")
+            return
+
+        name_tf = ft.TextField(
+            label="Track name",
+            value=str(track.name or "").strip(),
+            autofocus=True,
+            dense=True,
+            width=340,
+        )
+
+        def _cancel(_e=None) -> None:
+            try:
+                page.pop_dialog()
+            except Exception:
+                pass
+
+        def _apply(_e=None) -> None:
+            raw = str(name_tf.value or "").strip()
+            if not raw:
+                snack("Track name cannot be empty")
+                return
+
+            existing = {str(t.name or "").strip().lower() for t in state.project.tracks if t.id != track.id}
+            candidate = raw
+            base = raw
+            n = 2
+            while candidate.lower() in existing:
+                candidate = f"{base} ({n})"
+                n += 1
+
+            new_name = candidate
+            if new_name == track.name:
+                _cancel()
+                return
+
+            _history_record(f"Rename track {track.name}->{new_name}")
+            track.name = new_name
+            _mark_dirty()
+            _cancel()
+            refresh_timeline()
+
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Rename Track"),
+            content=name_tf,
+            actions=[
+                ft.TextButton("Cancel", on_click=_cancel),
+                ft.FilledButton("Rename", icon=ft.Icons.EDIT, on_click=_apply),
+            ],
+        )
+        page.show_dialog(dlg)
+        page.update()
 
     # ---------- Actions ----------
     def import_click(_e):
@@ -3944,12 +4062,15 @@ def main(page: ft.Page) -> None:
         [
             ft.OutlinedButton("Add V", icon=ft.Icons.VIDEO_COLLECTION, on_click=add_video_track_click),
             ft.OutlinedButton("Add A", icon=ft.Icons.AUDIOTRACK, on_click=add_audio_track_click),
+            ft.OutlinedButton("Up", icon=ft.Icons.ARROW_UPWARD, on_click=move_selected_track_up_click),
+            ft.OutlinedButton("Down", icon=ft.Icons.ARROW_DOWNWARD, on_click=move_selected_track_down_click),
+            ft.OutlinedButton("Rename", icon=ft.Icons.EDIT, on_click=rename_selected_track_click),
             ft.OutlinedButton("Mute/Unmute", icon=ft.Icons.VOLUME_OFF, on_click=toggle_selected_track_mute_click),
             ft.OutlinedButton("Show/Hide", icon=ft.Icons.VISIBILITY_OFF, on_click=toggle_selected_track_visible_click),
             ft.TextButton("Remove Selected Track", icon=ft.Icons.DELETE_FOREVER, on_click=remove_selected_track_click),
         ],
         spacing=6,
-        wrap=False,
+        wrap=True,
     )
 
     timeline_content = ft.Column(

@@ -150,6 +150,7 @@ class TestProjectModel(unittest.TestCase):
         a2 = p.add_track("audio")
         self.assertEqual(len(p.video_tracks), 2)
         self.assertEqual(len(p.audio_tracks), 2)
+        self.assertEqual([t.kind for t in p.tracks], ["video", "video", "audio", "audio"])
 
         self.assertTrue(p.remove_track(v2.id))
         self.assertTrue(p.remove_track(a2.id))
@@ -158,6 +159,20 @@ class TestProjectModel(unittest.TestCase):
 
         self.assertFalse(p.remove_track(p.video_tracks[0].id))
         self.assertFalse(p.remove_track(p.audio_tracks[0].id))
+
+    def test_project_move_track_reorders_within_kind(self):
+        p = Project(v_clips=[], a_clips=[])
+        v2 = p.add_track("video")
+        v3 = p.add_track("video")
+
+        self.assertEqual([t.name for t in p.video_tracks], ["V1", v2.name, v3.name])
+
+        # Move V3 above V2.
+        self.assertTrue(p.move_track(v3.id, -1))
+        self.assertEqual([t.name for t in p.video_tracks], ["V1", v3.name, v2.name])
+
+        # Boundary: cannot move further up within its kind.
+        self.assertFalse(p.move_track(p.video_tracks[0].id, -1))
 
     def test_project_constructor_accepts_track_objects(self):
         t = Track(id="v2", name="V2", kind="video", clips=[Clip(id="x", src="a.mp4", in_sec=0.0, out_sec=2.0)])

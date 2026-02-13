@@ -255,6 +255,7 @@ class Project:
                     self.tracks.append(Track.from_dict(t))
 
         self._ensure_minimum_tracks()
+        self._normalize_track_order()
         if tracks is None:
             self.v_clips = list(v_clips or [])
             self.a_clips = list(a_clips or [])
@@ -333,6 +334,25 @@ class Project:
         self._ensure_minimum_tracks()
         return self.audio_tracks[0]
 
+    def _normalize_track_order(self) -> None:
+        """
+        Keep a stable, editor-friendly ordering:
+        - all video tracks first (layer order top-to-bottom)
+        - all audio tracks last
+
+        This does not change the relative order within each kind.
+        """
+
+        def _rank(t: Track) -> int:
+            k = str(getattr(t, "kind", "") or "").strip().lower()
+            if k == "video":
+                return 0
+            if k == "audio":
+                return 1
+            return 2
+
+        self.tracks = sorted(self.tracks, key=_rank)
+
     def add_track(self, kind: str, name: Optional[str] = None) -> Track:
         k = str(kind or "").strip().lower()
         if k not in ("video", "audio"):
@@ -351,6 +371,7 @@ class Project:
             visible=True,
         )
         self.tracks.append(t)
+        self._normalize_track_order()
         return t
 
     def remove_track(self, track_id: str) -> bool:
@@ -362,6 +383,55 @@ class Project:
             # Keep at least one track of each kind for backward compatibility and UI stability.
             return False
         self.tracks = [x for x in self.tracks if x.id != t.id]
+        self._normalize_track_order()
+        return True
+
+    def move_track(self, track_id: str, delta: int) -> bool:
+        """
+        Reorder a track within its kind group (video/audio).
+
+        This affects:
+        - UI ordering
+        - export base/overlay ordering for video tracks
+        """
+        t = self.get_track(track_id)
+        if t is None:
+            return False
+        try:
+            step = int(delta)
+        except Exception:
+            step = 0
+        if step == 0:
+            return False
+
+        kind = str(t.kind or "").strip().lower()
+        if kind not in ("video", "audio"):
+            return False
+
+        try:
+            cur_idx = next(i for i, x in enumerate(self.tracks) if x.id == t.id)
+        except StopIteration:
+            return False
+
+        kind_indices = [i for i, x in enumerate(self.tracks) if str(x.kind).lower() == kind]
+        try:
+            pos = kind_indices.index(cur_idx)
+        except ValueError:
+            return False
+
+        new_pos = pos + step
+        if new_pos < 0 or new_pos >= len(kind_indices):
+            return False
+
+        new_idx = kind_indices[new_pos]
+        if new_idx == cur_idx:
+            return False
+
+        moving = self.tracks.pop(cur_idx)
+        if cur_idx < new_idx:
+            new_idx -= 1
+        self.tracks.insert(new_idx, moving)
+        self._normalize_track_order()
         return True
 
     def _ensure_minimum_tracks(self) -> None:
